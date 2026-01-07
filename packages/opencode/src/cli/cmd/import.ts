@@ -4,7 +4,20 @@ import { cmd } from "./cmd"
 import { bootstrap } from "../bootstrap"
 import { Storage } from "../../storage/storage"
 import { Instance } from "../../project/instance"
+import { Config } from "../../config/config"
 import { EOL } from "os"
+
+async function getBaseUrl() {
+  const cfg = await Config.get()
+  return cfg.enterprise?.url ?? "https://opncd.ai"
+}
+
+function parseShareUrl(input: string): string | undefined {
+  const parsed = URL.parse(input)
+  if (!parsed) return undefined
+  const match = parsed.pathname.match(/^\/(?:share|s)\/([a-zA-Z0-9_-]+)/)
+  return match?.[1]
+}
 
 export const ImportCommand = cmd({
   command: "import <file>",
@@ -31,15 +44,15 @@ export const ImportCommand = cmd({
       const isUrl = args.file.startsWith("http://") || args.file.startsWith("https://")
 
       if (isUrl) {
-        const urlMatch = args.file.match(/https?:\/\/opncd\.ai\/share\/([a-zA-Z0-9_-]+)/)
-        if (!urlMatch) {
-          process.stdout.write(`Invalid URL format. Expected: https://opncd.ai/share/<slug>`)
+        const slug = parseShareUrl(args.file)
+        if (!slug) {
+          process.stdout.write(`Invalid URL format. Expected a share URL with path /share/<id> or /s/<id>`)
           process.stdout.write(EOL)
           return
         }
 
-        const slug = urlMatch[1]
-        const response = await fetch(`https://opncd.ai/api/share/${slug}`)
+        const base = await getBaseUrl()
+        const response = await fetch(`${base}/api/share/${slug}`)
 
         if (!response.ok) {
           process.stdout.write(`Failed to fetch share data: ${response.statusText}`)

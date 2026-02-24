@@ -9,7 +9,11 @@
  * @see https://www.rfc-editor.org/rfc/rfc7617.html (Basic auth)
  */
 
-import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, noopLogger, type ASMetadata, type Logger } from "./discovery"
+import path from "path"
+import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, type ASMetadata } from "./discovery"
+import { Log } from "../util/log"
+import { Filesystem } from "../util/filesystem"
+import { Global } from "../global"
 
 // ---------------------------------------------------------------------------
 // CredentialStore interface
@@ -104,7 +108,7 @@ export function expired(cred: Credential): boolean {
  * Uses Buffer.from() for Basic auth to properly handle UTF-8 encoding
  * per RFC 7617 §2.1, unlike btoa() which throws on non-ASCII.
  */
-export function headers(cred: Credential, logger: Logger = noopLogger): Record<string, string> {
+export function headers(cred: Credential, logger: Log.Logger = Log.create({ service: "webfetch-auth" })): Record<string, string> {
   if (cred.scheme === "bearer" && cred.access_token) {
     // Defense-in-depth: reject tokens containing CR/LF characters.
     // Modern fetch() implementations reject CRLF in header values, but
@@ -150,7 +154,7 @@ export async function refresh(
   cred: Credential,
   metadata: ASMetadata,
   store: CredentialStore,
-  logger: Logger = noopLogger,
+  logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
 ): Promise<Credential | undefined> {
   if (!cred.refresh_token || !metadata.token_endpoint) return undefined
   if (!requireHttps(metadata.token_endpoint)) return undefined
@@ -225,7 +229,7 @@ export async function refresh(
 export async function resolveCredentials(
   url: string,
   store: CredentialStore,
-  logger: Logger = noopLogger,
+  logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
 ): Promise<Record<string, string>> {
   const cred = await lookup(url, store).catch(() => undefined)
   if (!cred) return {}
@@ -254,4 +258,33 @@ export async function resolveCredentials(
 
   if (!expired(cred)) return headers(cred, logger)
   return {}
+}
+
+// ---------------------------------------------------------------------------
+// File-backed credential store — namespace pattern matching Auth/McpAuth
+// ---------------------------------------------------------------------------
+
+const filepath = path.join(Global.Path.data, "webfetch-auth.json")
+
+async function load(): Promise<Record<string, Credential>> {
+  return Filesystem.readJson<Record<string, Credential>>(filepath).catch(() => ({}))
+}
+
+export const store: CredentialStore = {
+  async get(resource) {
+    const data = await load()
+    return data[resource]
+  },
+  async set(resource, cred) {
+    const data = await load()
+    await Filesystem.writeJson(filepath, { ...data, [resource]: cred }, 0o600)
+  },
+  async remove(resource) {
+    const data = await load()
+    delete data[resource]
+    await Filesystem.writeJson(filepath, data, 0o600)
+  },
+  async all() {
+    return load()
+  },
 }

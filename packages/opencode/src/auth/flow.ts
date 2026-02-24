@@ -25,7 +25,8 @@
  */
 
 import { createServer, type Server } from "node:http"
-import { requireHttps, isLoopback, noopLogger, type ASMetadata, type ResourceMetadata, type Logger } from "./discovery"
+import { requireHttps, isLoopback, type ASMetadata, type ResourceMetadata } from "./discovery"
+import { Log } from "../util/log"
 
 // ---------------------------------------------------------------------------
 // Interaction interface — user-facing touchpoints
@@ -105,7 +106,7 @@ export function escapeHtml(str: string): string {
 const DEFAULT_SUCCESS_HTML = `<!DOCTYPE html>
 <html>
 <head>
-  <title>Authorization Successful</title>
+  <title>OpenCode - Authorization Successful</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
     .container { text-align: center; padding: 2rem; }
@@ -116,7 +117,7 @@ const DEFAULT_SUCCESS_HTML = `<!DOCTYPE html>
 <body>
   <div class="container">
     <h1>Authorization Successful</h1>
-    <p>You can close this window and return to the application.</p>
+    <p>You can close this window and return to OpenCode.</p>
   </div>
   <script>setTimeout(() => window.close(), 2000);</script>
 </body>
@@ -126,7 +127,7 @@ function defaultErrorHtml(error: string): string {
   return `<!DOCTYPE html>
 <html>
 <head>
-  <title>Authorization Failed</title>
+  <title>OpenCode - Authorization Failed</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
     .container { text-align: center; padding: 2rem; }
@@ -328,7 +329,7 @@ export async function register(
   metadata: ASMetadata,
   redirectUri: string,
   registration: ClientRegistration,
-  logger: Logger = noopLogger,
+  logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
 ): Promise<ClientInfo | undefined> {
   if (!metadata.registration_endpoint) return undefined
 
@@ -435,10 +436,10 @@ export async function authorizationCode(
     server: CallbackServer
     interaction: Interaction
     registration: ClientRegistration
-    logger?: Logger
+    logger?: Log.Logger
   },
 ): Promise<TokenResult | undefined> {
-  const log = opts.logger ?? noopLogger
+  const log = opts.logger ?? Log.create({ service: "webfetch-auth" })
 
   if (!asMeta.authorization_endpoint || !asMeta.token_endpoint) {
     log.error("AS missing required endpoints", { issuer: asMeta.issuer })
@@ -606,9 +607,9 @@ export async function deviceCode(
   asMeta: ASMetadata,
   client: ClientInfo,
   scopes?: string[],
-  logger?: Logger,
+  logger?: Log.Logger,
 ): Promise<{ info: DeviceInfo; poll: () => Promise<TokenResult | undefined> } | undefined> {
-  const log = logger ?? noopLogger
+  const log = logger ?? Log.create({ service: "webfetch-auth" })
 
   if (!asMeta.device_authorization_endpoint || !asMeta.token_endpoint) {
     log.info("AS does not support device code flow", { issuer: asMeta.issuer })

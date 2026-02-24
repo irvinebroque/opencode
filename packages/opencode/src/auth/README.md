@@ -114,11 +114,7 @@ Executes OAuth flows:
 
 ### `webfetch-auth.ts`
 
-Credential types, matching logic, and pure functions for the webfetch auth system. Defines the `CredentialStore` interface and `Credential` type. Supports `bearer` and `basic` auth schemes. Credential lookup (`lookup()`) uses three-tier URL matching: exact URL, then origin, then longest path-prefix match (path-segment-boundary-aware, per [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html#section-3) protection space semantics). Handles token refresh via the `refresh_token` grant ([RFC 6749 &sect;6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)). Provides `resolveCredentials()` which combines lookup + auto-refresh for Layer 1 (pre-request credential injection).
-
-### `store.ts`
-
-File-based `CredentialStore` implementation. Persists credentials as JSON at `$XDG_DATA_HOME/opencode/webfetch-auth.json` (file mode `0600`, directory mode `0700`). Uses an in-memory mutex to serialize concurrent operations and atomic writes (write-to-tmp-then-rename) to prevent corruption on crash.
+Credential types, matching logic, pure functions, and file-backed store for the webfetch auth system. Defines the `CredentialStore` interface and `Credential` type. Supports `bearer` and `basic` auth schemes. Credential lookup (`lookup()`) uses three-tier URL matching: exact URL, then origin, then longest path-prefix match (path-segment-boundary-aware, per [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html#section-3) protection space semantics). Handles token refresh via the `refresh_token` grant ([RFC 6749 &sect;6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)). Provides `resolveCredentials()` which combines lookup + auto-refresh for Layer 1 (pre-request credential injection). The file-backed store persists credentials as JSON at `$XDG_DATA_HOME/opencode/webfetch-auth.json` (file mode `0600`) using `Filesystem.readJson`/`writeJson`, following the same pattern as `Auth` and `McpAuth`.
 
 ### `orchestrate.ts`
 

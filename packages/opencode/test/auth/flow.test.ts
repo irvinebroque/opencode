@@ -52,6 +52,18 @@ describe("PKCE generation (RFC 7636 §4.1-§4.2)", () => {
     const expected = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
     expect(result.challenge).toBe(expected)
   })
+
+  test("RFC 7636 Appendix B test vector", async () => {
+    // Official test vector from RFC 7636 Appendix B:
+    // verifier:  dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+    // challenge: E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+    const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))
+    const bytes = new Uint8Array(hash)
+    const binary = String.fromCharCode(...bytes)
+    const challenge = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+    expect(challenge).toBe("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
+  })
 })
 
 // ---------------------------------------------------------------------------

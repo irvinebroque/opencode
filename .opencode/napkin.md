@@ -25,6 +25,7 @@ Last updated: 2026-02-23
 ## Manual Approval Log
 | Date | Source | Pattern | Intent | Outcome | Recommendation |
 |------|--------|---------|--------|---------|----------------|
+| 2026-02-23 | tool | `git push --no-verify` | Push commit; pre-push hook fails on pre-existing console-function TS errors | approved | allow (pre-existing errors unrelated to branch) |
 
 ## Winning Patterns
 - The existing auth JSON file pattern (`0o600` permissions, zod schema) in `src/auth/index.ts` is the standard for credential storage

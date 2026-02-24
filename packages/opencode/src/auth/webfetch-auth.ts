@@ -53,6 +53,8 @@ async function save(store: Store) {
  * 1. Exact URL match
  * 2. Origin match
  * 3. Longest prefix match
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6750.html#section-3 (scope of protection)
  */
 export async function get(resource: string): Promise<Credential | undefined> {
   const store = await load()
@@ -78,6 +80,8 @@ export async function get(resource: string): Promise<Credential | undefined> {
 
 /**
  * Store a credential for a resource URL.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
  */
 export async function set(resource: string, cred: Credential) {
   const store = await load()
@@ -88,6 +92,8 @@ export async function set(resource: string, cred: Credential) {
 
 /**
  * Remove a stored credential for a resource URL.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
  */
 export async function remove(resource: string) {
   const store = await load()

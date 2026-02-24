@@ -90,6 +90,18 @@ describe("asMetadataUrl (RFC 8414 §3.1)", () => {
       "https://as.example.com/.well-known/oauth-authorization-server",
     )
   })
+
+  test("issuer with nested path", () => {
+    expect(asMetadataUrl("https://example.com/tenant/sub")).toBe(
+      "https://example.com/.well-known/oauth-authorization-server/tenant/sub",
+    )
+  })
+
+  test("issuer with nested path and trailing slash", () => {
+    expect(asMetadataUrl("https://example.com/tenant/sub/")).toBe(
+      "https://example.com/.well-known/oauth-authorization-server/tenant/sub",
+    )
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -203,6 +215,47 @@ describe("fetchResourceMetadata validation", () => {
     expect(result).toBeUndefined()
   })
 
+  test("rejects metadata from a redirect (RFC 9728 §3.2)", async () => {
+    // RFC 9728 §3.2: "The resource server MUST NOT redirect"
+    // Our fetch uses redirect: "error" so a 302 should cause rejection
+    let resPort = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/target") {
+          return new Response(
+            JSON.stringify({ resource: `http://localhost:${resPort}` }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        // Return a redirect
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `http://localhost:${resPort}/target` },
+        })
+      },
+    })
+    resPort = s.port as number
+    servers.push(s)
+    const result = await fetchResourceMetadata(
+      `http://localhost:${resPort}`,
+      `http://localhost:${resPort}`,
+    )
+    // redirect: "error" causes fetch to reject → result is undefined
+    expect(result).toBeUndefined()
+  })
+
+  test("accepts application/json with charset parameter", async () => {
+    const url = serve(
+      { resource: "https://example.com" },
+      "application/json; charset=utf-8",
+    )
+    const result = await fetchResourceMetadata(url, "https://example.com")
+    expect(result).toBeDefined()
+    expect(result!.resource).toBe("https://example.com")
+  })
+
   test("accepts valid metadata with all fields", async () => {
     const url = serve({
       resource: "https://example.com",
@@ -263,6 +316,63 @@ describe("fetchASMetadata validation", () => {
   test("rejects metadata with wrong content-type", async () => {
     const issuer = serveAS({ issuer: "placeholder" }, "text/plain")
     const result = await fetchASMetadata(issuer)
+    expect(result).toBeUndefined()
+  })
+
+  test("accepts application/json with charset in Content-Type", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://localhost:${port}`,
+            authorization_endpoint: `http://localhost:${port}/authorize`,
+            token_endpoint: `http://localhost:${port}/token`,
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json; charset=utf-8" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://localhost:${port}`)
+    expect(result).toBeDefined()
+    expect(result!.issuer).toBe(`http://localhost:${port}`)
+  })
+
+  test("rejects text/plain content-type for AS metadata", async () => {
+    const issuer = serveAS(
+      {
+        issuer: "placeholder",
+        response_types_supported: ["code"],
+      },
+      "text/plain",
+    )
+    const result = await fetchASMetadata(issuer)
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects empty response_types_supported array (RFC 8414 §2)", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://localhost:${port}`,
+            authorization_endpoint: `http://localhost:${port}/authorize`,
+            token_endpoint: `http://localhost:${port}/token`,
+            response_types_supported: [],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://localhost:${port}`)
     expect(result).toBeUndefined()
   })
 

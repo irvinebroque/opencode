@@ -174,6 +174,27 @@ describe("WWW-Authenticate parser (RFC 9110 §11.6.1)", () => {
     expect(result[0]!.params["error"]).toBe("invalid_token")
   })
 
+  test("rejects unterminated quoted-string per RFC 9110 §5.6.4", () => {
+    // RFC 9110 §5.6.4: the grammar requires a closing DQUOTE.
+    // The malformed param value is rejected; remaining text may be
+    // misinterpreted as additional challenges (parser recovery behavior).
+    const result = parse('Bearer realm="no closing quote')
+    const bearer = result.find((c) => c.scheme === "Bearer")
+    expect(bearer).toBeDefined()
+    // realm param must NOT be present — the unterminated quoted-string is rejected
+    expect(bearer!.params["realm"]).toBeUndefined()
+  })
+
+  test("rejects unterminated quoted-string mid-param-list", () => {
+    // First param parses fine, second has unterminated quote — rejected
+    const result = parse('Bearer error=invalid_token, realm="unclosed')
+    const bearer = result.find((c) => c.scheme === "Bearer")
+    expect(bearer).toBeDefined()
+    expect(bearer!.params["error"]).toBe("invalid_token")
+    // realm's unterminated quoted-string is rejected
+    expect(bearer!.params["realm"]).toBeUndefined()
+  })
+
   // -----------------------------------------------------------------------
   // RFC 9728 §5.1: resource_metadata in Bearer challenge
   // -----------------------------------------------------------------------

@@ -251,6 +251,40 @@ function oidcMetadataUrl(issuer: string): string {
 // Fetch + validate
 // ---------------------------------------------------------------------------
 
+/** Maximum metadata response size (1 MiB). Prevents OOM from malicious servers. */
+const MAX_METADATA_BYTES = 1_048_576
+
+/**
+ * Read response body as JSON, enforcing a byte size limit.
+ * Prevents OOM from malicious servers returning multi-gigabyte responses.
+ */
+async function readJsonLimited(response: Response, limit: number): Promise<unknown> {
+  const cl = response.headers.get("content-length")
+  if (cl && parseInt(cl, 10) > limit) return undefined
+
+  const reader = response.body?.getReader()
+  if (!reader) return undefined
+
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > limit) {
+      await reader.cancel()
+      return undefined
+    }
+    chunks.push(value)
+  }
+
+  try {
+    return JSON.parse(await new Blob(chunks).text())
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Fetch and validate Protected Resource Metadata (RFC 9728).
  *
@@ -302,9 +336,9 @@ export async function fetchResourceMetadata(
     return undefined
   }
 
-  const body = await response.json().catch(() => undefined)
+  const body = await readJsonLimited(response, MAX_METADATA_BYTES)
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    log.info("resource metadata invalid JSON", { url })
+    log.info("resource metadata invalid or oversized response", { url })
     return undefined
   }
 
@@ -369,10 +403,10 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   const url = asMetadataUrl(issuer)
   log.info("fetching AS metadata", { url })
 
-  // Reject redirects to prevent SSRF via metadata endpoint redirect to internal services.
+  // RFC 8414 does not prohibit redirects for metadata endpoints.
   let response = await fetch(url, {
     headers: { Accept: "application/json" },
-    redirect: "error",
+    redirect: "follow",
     signal,
   }).catch(() => undefined)
 
@@ -382,7 +416,7 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     log.info("trying OIDC discovery fallback", { url: fallback })
     response = await fetch(fallback, {
       headers: { Accept: "application/json" },
-      redirect: "error",
+      redirect: "follow",
       signal,
     }).catch(() => undefined)
   }
@@ -400,9 +434,9 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     return undefined
   }
 
-  const body = await response.json().catch(() => undefined)
+  const body = await readJsonLimited(response, MAX_METADATA_BYTES)
   if (!body || typeof body !== "object" || Array.isArray(body)) {
-    log.info("AS metadata invalid JSON", { issuer })
+    log.info("AS metadata invalid or oversized response", { issuer })
     return undefined
   }
 

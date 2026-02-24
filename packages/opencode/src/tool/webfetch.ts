@@ -92,13 +92,6 @@ export const WebFetchTool = Tool.define(
                 }
               }
 
-              const cfId = process.env.CF_ACCESS_CLIENT_ID
-              const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
-              if (cfId && cfSecret && !Object.keys(extra).length) {
-                extra["CF-Access-Client-Id"] = cfId
-                extra["CF-Access-Client-Secret"] = cfSecret
-              }
-
               const initial = await fetch(params.url, {
                 signal,
                 headers: { ...headers, ...extra },
@@ -234,16 +227,6 @@ function convertHTMLToMarkdown(html: string): string {
   return turndownService.turndown(html)
 }
 
-// Detect CF Access login pages: redirect to *.cloudflareaccess.com or body markers
-function isCfAccess(response: Response): boolean {
-  const location = response.headers.get("location") ?? ""
-  if (location.includes("cloudflareaccess.com")) return true
-  // cf-mitigated without "challenge" (which is bot detection) could indicate Access
-  const mitigated = response.headers.get("cf-mitigated")
-  if (mitigated && mitigated !== "challenge") return true
-  return false
-}
-
 async function handleAuth(
   response: Response,
   url: string,
@@ -257,34 +240,7 @@ async function handleAuth(
   const challenges = WwwAuthenticate.all(response)
   const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
 
-  // 2. Check for CF Access service token env vars on 403
-  if (response.status === 403 || isCfAccess(response)) {
-    const cfId = process.env.CF_ACCESS_CLIENT_ID
-    const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
-    if (cfId && cfSecret) {
-      log.info("retrying with CF Access service token", { url })
-      const retry = await fetch(url, {
-        signal,
-        headers: {
-          ...base,
-          "CF-Access-Client-Id": cfId,
-          "CF-Access-Client-Secret": cfSecret,
-        },
-      })
-      if (retry.ok) {
-        // Store for future use
-        await WebFetchAuth.set(new URL(url).origin, {
-          resource: new URL(url).origin,
-          scheme: "service-token",
-          client_id: cfId,
-          client_secret: cfSecret,
-        })
-        return retry
-      }
-    }
-  }
-
-  // 3. RFC 9728 / RFC 8414 discovery
+  // 2. RFC 9728 / RFC 8414 discovery
   const discovery = await Discovery.discover(url, metaUrl ?? undefined)
 
   if (!discovery.resource || !discovery.servers.length) {
@@ -292,11 +248,9 @@ async function handleAuth(
     const basic = challenges.find((c) => c.scheme.toLowerCase() === "basic")
     if (basic) {
       log.info("basic auth challenge detected", { realm: basic.params["realm"] })
-      // For now, return informative error rather than prompting
       throw new Error(
         `This URL requires Basic authentication (realm: ${basic.params["realm"] ?? "unknown"}). ` +
-          `Configure credentials via CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET env vars ` +
-          `or set up a service token for this origin.`,
+          `Configure credentials for this origin in the webfetch auth store.`,
       )
     }
 
@@ -306,7 +260,7 @@ async function handleAuth(
 
   const server = discovery.servers[0]
 
-  // 4. Resolve client credentials
+  // 3. Resolve client credentials
   let client: { client_id: string; client_secret?: string } | undefined
 
   // Try stored OAuth client from previous registration
@@ -330,7 +284,7 @@ async function handleAuth(
     )
   }
 
-  // 5. Prompt user for consent
+  // 4. Prompt user for consent
   await Effect.runPromise(
     ctx.ask({
       permission: "webfetch",
@@ -345,7 +299,7 @@ async function handleAuth(
     }),
   )
 
-  // 6. Execute OAuth flow (prefer auth code + PKCE)
+  // 5. Execute OAuth flow (prefer auth code + PKCE)
   const supports = server.grant_types_supported ?? ["authorization_code"]
 
   let cred: WebFetchAuth.Credential | undefined
@@ -382,7 +336,7 @@ async function handleAuth(
     throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
   }
 
-  // 7. Retry with credentials
+  // 6. Retry with credentials
   const retry = await fetch(url, {
     signal,
     headers: { ...base, ...WebFetchAuth.headers(cred) },

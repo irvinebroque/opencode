@@ -20,15 +20,7 @@ const CALLBACK_PATH = "/webfetch/oauth/callback"
 const CALLBACK_TIMEOUT = 5 * 60 * 1000 // 5 minutes
 const DEVICE_POLL_INTERVAL = 5000
 
-// PKCE generation (same pattern as plugin/codex.ts)
-
-function randomString(length: number): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~"
-  const bytes = crypto.getRandomValues(new Uint8Array(length))
-  return Array.from(bytes)
-    .map((b) => chars[b % chars.length])
-    .join("")
-}
+// PKCE generation per RFC 7636
 
 function base64url(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
@@ -37,7 +29,9 @@ function base64url(buffer: ArrayBuffer): string {
 }
 
 async function pkce(): Promise<{ verifier: string; challenge: string }> {
-  const verifier = randomString(43)
+  // RFC 7636 Section 4.1: verifier uses unreserved chars [A-Z / a-z / 0-9 / "-" / "." / "_" / "~"]
+  // 43-128 chars, minimum 32 bytes entropy. base64url of 32 random bytes = 43 chars, unbiased.
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)).buffer as ArrayBuffer)
   const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))
   return { verifier, challenge: base64url(hash) }
 }
@@ -279,15 +273,16 @@ export async function deviceCode(
         body: body.toString(),
       })
 
-      if (response.ok) {
-        const tokens = (await response.json()) as AuthResult
+      const json = (await response.json().catch(() => ({}))) as AuthResult & { error?: string }
+
+      if (response.ok && json.access_token) {
         const cred: WebFetchAuth.Credential = {
           resource: resourceMeta.resource,
           scheme: "bearer",
-          access_token: tokens.access_token,
-          refresh_token: tokens.refresh_token,
-          expires_at: tokens.expires_in ? Date.now() / 1000 + tokens.expires_in : undefined,
-          scope: tokens.scope ?? scope,
+          access_token: json.access_token,
+          refresh_token: json.refresh_token,
+          expires_at: json.expires_in ? Date.now() / 1000 + json.expires_in : undefined,
+          scope: json.scope ?? scope,
           oauth_client_id: client.client_id,
           oauth_client_secret: client.client_secret,
           issuer: asMeta.issuer,
@@ -297,15 +292,14 @@ export async function deviceCode(
       }
 
       // Check for "authorization_pending" or "slow_down"
-      const err = (await response.json().catch(() => ({}))) as { error?: string }
-      if (err.error === "slow_down") {
+      if (json.error === "slow_down") {
         await Bun.sleep(interval) // extra wait
         continue
       }
-      if (err.error === "authorization_pending") continue
+      if (json.error === "authorization_pending") continue
 
       // Any other error means failure
-      log.error("device code poll failed", { error: err.error, status: response.status })
+      log.error("device code poll failed", { error: json.error, status: response.status })
       return undefined
     }
 

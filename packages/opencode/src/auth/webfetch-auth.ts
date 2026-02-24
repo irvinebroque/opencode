@@ -12,7 +12,7 @@ import path from "path"
 import { mkdir, writeFile, rename } from "fs/promises"
 import { Global } from "../global"
 import { Log } from "../util/log"
-import { requireHttps, fetchASMetadata, type ASMetadata } from "./discovery"
+import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, type ASMetadata } from "./discovery"
 
 const log = Log.create({ service: "webfetch.auth" })
 const filepath = path.join(Global.Path.data, "webfetch-auth.json")
@@ -226,8 +226,16 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
  * per RFC 7617 §2.1, unlike btoa() which throws on non-ASCII.
  */
 export function headers(cred: Credential): Record<string, string> {
-  if (cred.scheme === "bearer" && cred.access_token)
+  if (cred.scheme === "bearer" && cred.access_token) {
+    // Defense-in-depth: reject tokens containing CR/LF characters.
+    // Modern fetch() implementations reject CRLF in header values, but
+    // this provides an additional layer against header injection.
+    if (/[\r\n]/.test(cred.access_token)) {
+      log.error("access_token contains CR/LF, refusing to use", { resource: cred.resource })
+      return {}
+    }
     return { Authorization: `Bearer ${cred.access_token}` }
+  }
 
   if (cred.scheme === "basic" && cred.username !== undefined && cred.password !== undefined) {
     // RFC 7617 §2: user-id MUST NOT contain ":" — it is used as the
@@ -254,6 +262,20 @@ export async function resolve(url: string): Promise<Record<string, string>> {
   if (!cred) return {}
 
   if (expired(cred) && cred.refresh_token && cred.issuer) {
+    // SSRF protection: validate stored issuer before fetching AS metadata.
+    // A malicious credential store entry could set issuer to a private IP
+    // (e.g., "https://169.254.169.254") to probe internal services during
+    // token refresh. Defense-in-depth — fetchASMetadata() also checks.
+    const issuerUrl = requireHttps(cred.issuer)
+    if (!issuerUrl) return {}
+    if (!isLoopback(issuerUrl.hostname) && await isPrivateNetwork(issuerUrl.hostname)) {
+      log.error("stored issuer targets private network, skipping refresh", {
+        resource: cred.resource,
+        issuer: cred.issuer,
+      })
+      return {}
+    }
+
     const as = await fetchASMetadata(cred.issuer)
     if (as) {
       const refreshed = await refresh(cred, as)

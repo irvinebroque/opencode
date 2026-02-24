@@ -157,6 +157,43 @@ describe("headers()", () => {
     }
     expect(headers(cred)).toEqual({})
   })
+
+  test("rejects bearer token with CRLF (header injection prevention, M7)", () => {
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "token\r\nX-Injected: evil",
+    }
+    expect(headers(cred)).toEqual({})
+  })
+
+  test("rejects bearer token with lone LF (M7)", () => {
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "token\nevil",
+    }
+    expect(headers(cred)).toEqual({})
+  })
+
+  test("rejects bearer token with lone CR (M7)", () => {
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "token\revil",
+    }
+    expect(headers(cred)).toEqual({})
+  })
+
+  test("allows normal bearer tokens without CR/LF", () => {
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.valid.token",
+    }
+    const result = headers(cred)
+    expect(result.Authorization).toBe("Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.valid.token")
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -297,6 +334,50 @@ describe("resolve()", () => {
 
   test("returns empty headers when no credential exists", async () => {
     const result = await resolve("https://no-such-credential.example.com")
+    expect(result).toEqual({})
+  })
+
+  test("rejects refresh for credential with private-network issuer (M4)", async () => {
+    // A malicious credential store entry could set issuer to a private IP
+    // (e.g., cloud metadata endpoint) to probe internal services.
+    const cred: Credential = {
+      resource: "https://resolve-test.example.com",
+      scheme: "bearer",
+      access_token: "expired-token",
+      refresh_token: "refresh-me",
+      issuer: "https://169.254.169.254",
+      expires_at: Date.now() / 1000 - 60,
+    }
+    await set("https://resolve-test.example.com", cred)
+    const result = await resolve("https://resolve-test.example.com")
+    expect(result).toEqual({})
+  })
+
+  test("rejects refresh for credential with RFC 1918 issuer (M4)", async () => {
+    const cred: Credential = {
+      resource: "https://resolve-test.example.com",
+      scheme: "bearer",
+      access_token: "expired-token",
+      refresh_token: "refresh-me",
+      issuer: "https://10.0.0.1",
+      expires_at: Date.now() / 1000 - 60,
+    }
+    await set("https://resolve-test.example.com", cred)
+    const result = await resolve("https://resolve-test.example.com")
+    expect(result).toEqual({})
+  })
+
+  test("rejects refresh for credential with non-HTTPS issuer (M4)", async () => {
+    const cred: Credential = {
+      resource: "https://resolve-test.example.com",
+      scheme: "bearer",
+      access_token: "expired-token",
+      refresh_token: "refresh-me",
+      issuer: "http://evil.example.com",
+      expires_at: Date.now() / 1000 - 60,
+    }
+    await set("https://resolve-test.example.com", cred)
+    const result = await resolve("https://resolve-test.example.com")
     expect(result).toEqual({})
   })
 })

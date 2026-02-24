@@ -690,7 +690,10 @@ async function callbackServer(
         : "xdg-open"
   Bun.spawn([open, authUrl], { stdout: "ignore", stderr: "ignore" })
 
-  log.info("opened browser for authorization", { url: authUrl, port })
+  // Log only the host — the full URL contains the state parameter and
+  // code_challenge which, while not secret, could be exploited by an
+  // attacker with access to aggregated logs + the callback server.
+  log.info("opened browser for authorization", { host: new URL(authUrl).host, port })
 
   timer = setTimeout(() => {
     log.error("authorization callback timed out")

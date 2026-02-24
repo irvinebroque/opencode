@@ -84,6 +84,41 @@ describe("WWW-Authenticate parser (RFC 9110 §11.6.1)", () => {
     expect(result[0]!.params["realm"]).toBe("path\\to\\file")
   })
 
+  test("accepts valid quoted-pair characters per RFC 9110 §5.6.4", () => {
+    // HTAB, SP, VCHAR (0x21-0x7E), obs-text (0x80-0xFF) are all valid
+    const result = parse('Bearer realm="escaped\\tHTAB"')
+    expect(result).toHaveLength(1)
+    expect(result[0]!.params["realm"]).toBe("escapedtHTAB")
+  })
+
+  test("rejects quoted-pair with NUL character per RFC 9110 §5.6.4", () => {
+    // NUL (0x00) is excluded from quoted-pair
+    const input = 'Bearer realm="test\\\x00value"'
+    const result = parse(input)
+    expect(result).toHaveLength(1)
+    expect(result[0]!.scheme).toBe("Bearer")
+    // Quoted-string with invalid escaped char is rejected
+    expect(result[0]!.params["realm"]).toBeUndefined()
+  })
+
+  test("rejects quoted-pair with C0 control character per RFC 9110 §5.6.4", () => {
+    // BEL (0x07) is a C0 control — excluded from quoted-pair
+    const input = 'Bearer realm="test\\\x07value"'
+    const result = parse(input)
+    expect(result).toHaveLength(1)
+    expect(result[0]!.scheme).toBe("Bearer")
+    expect(result[0]!.params["realm"]).toBeUndefined()
+  })
+
+  test("rejects quoted-pair with DEL character per RFC 9110 §5.6.4", () => {
+    // DEL (0x7F) is explicitly excluded from quoted-pair
+    const input = 'Bearer realm="test\\\x7Fvalue"'
+    const result = parse(input)
+    expect(result).toHaveLength(1)
+    expect(result[0]!.scheme).toBe("Bearer")
+    expect(result[0]!.params["realm"]).toBeUndefined()
+  })
+
   // -----------------------------------------------------------------------
   // Token68 — RFC 7235 §2.1
   // -----------------------------------------------------------------------

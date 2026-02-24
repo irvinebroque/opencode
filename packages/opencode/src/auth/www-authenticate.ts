@@ -20,6 +20,8 @@
  * @see https://www.rfc-editor.org/rfc/rfc7235.html#section-2.1
  */
 
+import { isLoopback } from "./discovery"
+
 export type Challenge = {
   scheme: string
   params: Record<string, string>
@@ -73,19 +75,27 @@ function isQuotedPairChar(c: string): boolean {
 function parseQuotedString(input: string, i: number): { value: string; end: number } | undefined {
   if (input[i] !== '"') return undefined
   i++
-  let result = ""
+  // Use array accumulation instead of repeated string concatenation to avoid
+  // O(n^2) copying. Each `result += c` creates a new string; for a quoted
+  // string of length N this causes ~N/2 allocations with increasing sizes.
+  const parts: string[] = []
+  let start = i
   while (i < input.length) {
     const c = input[i]!
-    if (c === '"') return { value: result, end: i + 1 }
+    if (c === '"') {
+      if (i > start) parts.push(input.slice(start, i))
+      return { value: parts.join(""), end: i + 1 }
+    }
     if (c === "\\" && i + 1 < input.length) {
       const escaped = input[i + 1]!
       // RFC 9110 §5.6.4: quoted-pair only allows HTAB / SP / VCHAR / obs-text
       if (!isQuotedPairChar(escaped)) return undefined
-      result += escaped
+      if (i > start) parts.push(input.slice(start, i))
+      parts.push(escaped)
       i += 2
+      start = i
       continue
     }
-    result += c
     i++
   }
   // RFC 9110 §5.6.4: grammar requires a closing DQUOTE; reject malformed strings
@@ -275,7 +285,18 @@ export function resourceMetadataUrl(challenges: Challenge[]): string | undefined
   // RFC 9728 §5.1: resource_metadata MAY appear in any auth scheme (not just Bearer).
   // DPoP and future schemes can also carry this parameter.
   for (const c of challenges) {
-    if (c.params["resource_metadata"]) return c.params["resource_metadata"]
+    const url = c.params["resource_metadata"]
+    if (!url) continue
+    // Validate the URL is HTTPS (or HTTP loopback) before returning it.
+    // The value comes from an untrusted server and could point at internal
+    // services (SSRF), use non-HTTP schemes (file://), or be garbage.
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol === "https:") return url
+      if (parsed.protocol === "http:" && isLoopback(parsed.hostname)) return url
+    } catch {
+      continue
+    }
   }
   return undefined
 }

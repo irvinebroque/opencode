@@ -131,11 +131,18 @@ export const WebFetchTool = Tool.define("webfetch", {
         ? await safeFetch(params.url, { signal, headers: { ...headers, "User-Agent": "opencode" } }, auth)
         : initial
 
-    // Auth handling: detect 401/403 and attempt RFC 9728/8414 authentication.
+    // Auth handling: detect 401 and attempt RFC 9728/8414 authentication.
+    // Only trigger on 403 if the server explicitly sent a WWW-Authenticate
+    // header — a bare 403 means "forbidden" (not an auth challenge) and a
+    // malicious server could abuse it to social-engineer the user into
+    // authenticating with a legitimate OAuth provider.
     // Clear the request timeout before entering the OAuth flow — the interactive
     // browser authorization may take minutes, and the 30s/120s timeout would
     // abort the signal mid-flow. The retry fetch uses ctx.abort instead.
-    if (!response.ok && (response.status === 401 || response.status === 403)) {
+    const tryAuth =
+      response.status === 401 ||
+      (response.status === 403 && response.headers.has("www-authenticate"))
+    if (!response.ok && tryAuth) {
       clearTimeout()
       const authed = await handleAuth(response, params.url, headers, ctx.abort, ctx)
       if (authed) response = authed
@@ -380,9 +387,10 @@ async function handleAuth(
   if (retry.ok) return retry
 
   // Remove stale credentials on retry failure so the user isn't stuck
-  // with a bad token on subsequent requests.
+  // with a bad token on subsequent requests. Use the canonical resource
+  // identifier (same key used by set()) — not the original request URL.
   log.error("auth retry failed, removing stale credential", { url, status: retry.status })
-  await WebFetchAuth.remove(url).catch(() => {})
+  await WebFetchAuth.remove(result.resource.resource).catch(() => {})
   return undefined
 }
 

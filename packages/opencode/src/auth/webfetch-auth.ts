@@ -169,9 +169,13 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
 
   log.info("refreshing token", { resource: cred.resource, issuer: cred.issuer })
 
+  // redirect: "error" prevents a malicious AS from redirecting the refresh
+  // POST to an internal service, leaking refresh tokens, client secrets,
+  // and resource identifiers to the redirect target.
   const response = await fetch(metadata.token_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    redirect: "error",
     body: body.toString(),
   }).catch(() => undefined)
 

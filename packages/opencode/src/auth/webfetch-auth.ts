@@ -1,34 +1,30 @@
 /**
  * Per-origin credential store for webfetch authentication.
  *
- * Stores bearer tokens and basic auth credentials in a JSON file
- * at $XDG_DATA_HOME/opencode/webfetch-auth.json with mode 0o600.
+ * Provides the CredentialStore interface for pluggable storage backends,
+ * three-tier URL matching (exact, origin, longest prefix), token refresh,
+ * and credential resolution with auto-refresh.
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer tokens)
  * @see https://www.rfc-editor.org/rfc/rfc7617.html (Basic auth)
  */
 
-import path from "path"
-import { mkdir, writeFile, rename } from "fs/promises"
-import { Global } from "../global"
-import { Log } from "../util/log"
-import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, type ASMetadata } from "./discovery"
+import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, noopLogger, type ASMetadata, type Logger } from "./discovery"
 
-const log = Log.create({ service: "webfetch.auth" })
-const filepath = path.join(Global.Path.data, "webfetch-auth.json")
+// ---------------------------------------------------------------------------
+// CredentialStore interface
+// ---------------------------------------------------------------------------
 
-// In-memory mutex to serialize load/modify/save operations and prevent
-// TOCTOU races when concurrent token refreshes or OAuth flows run.
-let lock = Promise.resolve()
-
-function serialized<T>(fn: () => Promise<T>): Promise<T> {
-  const prev = lock
-  let release!: () => void
-  lock = new Promise<void>((r) => {
-    release = r
-  })
-  return prev.then(fn).finally(release)
+export interface CredentialStore {
+  get(resource: string): Promise<Credential | undefined>
+  set(resource: string, cred: Credential): Promise<void>
+  remove(resource: string): Promise<void>
+  all(): Promise<Record<string, Credential>>
 }
+
+// ---------------------------------------------------------------------------
+// Credential types
+// ---------------------------------------------------------------------------
 
 export type Credential = {
   resource: string
@@ -44,94 +40,50 @@ export type Credential = {
   issuer?: string
 }
 
-type Store = Record<string, Credential>
-
-async function load(): Promise<Store> {
-  try {
-    return JSON.parse(await Bun.file(filepath).text()) as Store
-  } catch {
-    return {}
-  }
-}
-
-async function save(store: Store) {
-  // Ensure parent directory exists with 0o700 so other users cannot list
-  // the directory contents, even though the file itself is 0o600.
-  await mkdir(path.dirname(filepath), { recursive: true, mode: 0o700 })
-  // Atomic write: write to a temp file then rename. Prevents credential
-  // store corruption on crash — rename() is atomic on POSIX filesystems.
-  const tmp = filepath + ".tmp"
-  await writeFile(tmp, JSON.stringify(store, null, 2), { mode: 0o600 })
-  await rename(tmp, filepath)
-}
+// ---------------------------------------------------------------------------
+// Three-tier URL matching — RFC 6750 protection space semantics
+// ---------------------------------------------------------------------------
 
 /**
- * Look up a stored credential for a resource URL.
+ * Look up a stored credential for a resource URL using three-tier matching.
  *
  * Matching priority:
  * 1. Exact URL match
  * 2. Origin match
- * 3. Longest prefix match
+ * 3. Longest prefix match (path-segment-boundary-aware)
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html#section-3 (scope of protection)
  */
-export function get(resource: string): Promise<Credential | undefined> {
-  // Serialize reads with writes to prevent reading a partially-written file.
-  return serialized(async () => {
-    const store = await load()
-    const origin = new URL(resource).origin
+export async function lookup(resource: string, store: CredentialStore): Promise<Credential | undefined> {
+  const all = await store.all()
+  const origin = new URL(resource).origin
 
-    // Exact match first
-    if (store[resource]) return store[resource]
+  // Exact match first
+  if (all[resource]) return all[resource]
 
-    // Origin match
-    if (store[origin]) return store[origin]
+  // Origin match
+  if (all[origin]) return all[origin]
 
-    // Longest prefix match — origin-aware and path-segment-boundary-aware.
-    // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
-    // 2. Key must end at a path boundary (prevents /v1 matching /v1extra)
-    let best: Credential | undefined
-    let len = 0
-    for (const [key, cred] of Object.entries(store)) {
-      if (key.length <= len || !resource.startsWith(key)) continue
-      if (!URL.canParse(key) || new URL(key).origin !== origin) continue
-      const next = resource[key.length]
-      if (!next || next === "/" || next === "?" || next === "#") {
-        best = cred
-        len = key.length
-      }
+  // Longest prefix match — origin-aware and path-segment-boundary-aware.
+  // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
+  // 2. Key must end at a path boundary (prevents /v1 matching /v1extra)
+  let best: Credential | undefined
+  let len = 0
+  for (const [key, cred] of Object.entries(all)) {
+    if (key.length <= len || !resource.startsWith(key)) continue
+    if (!URL.canParse(key) || new URL(key).origin !== origin) continue
+    const next = resource[key.length]
+    if (!next || next === "/" || next === "?" || next === "#") {
+      best = cred
+      len = key.length
     }
-    return best
-  })
+  }
+  return best
 }
 
-/**
- * Store a credential for a resource URL.
- *
- * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
- */
-export function set(resource: string, cred: Credential) {
-  return serialized(async () => {
-    const store = await load()
-    store[resource] = cred
-    await save(store)
-    log.info("stored credential", { resource, scheme: cred.scheme })
-  })
-}
-
-/**
- * Remove a stored credential for a resource URL.
- *
- * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
- */
-export function remove(resource: string) {
-  return serialized(async () => {
-    const store = await load()
-    delete store[resource]
-    await save(store)
-    log.info("removed credential", { resource })
-  })
-}
+// ---------------------------------------------------------------------------
+// Pure functions
+// ---------------------------------------------------------------------------
 
 /**
  * Check if a credential's access token has expired.
@@ -144,6 +96,47 @@ export function expired(cred: Credential): boolean {
 }
 
 /**
+ * Build Authorization header value from a credential.
+ *
+ * RFC 6750 §2.1: Bearer token in Authorization header
+ * RFC 7617 §2: Basic credentials as base64(user-id ":" password)
+ *
+ * Uses Buffer.from() for Basic auth to properly handle UTF-8 encoding
+ * per RFC 7617 §2.1, unlike btoa() which throws on non-ASCII.
+ */
+export function headers(cred: Credential, logger: Logger = noopLogger): Record<string, string> {
+  if (cred.scheme === "bearer" && cred.access_token) {
+    // Defense-in-depth: reject tokens containing CR/LF characters.
+    // Modern fetch() implementations reject CRLF in header values, but
+    // this provides an additional layer against header injection.
+    if (/[\r\n]/.test(cred.access_token)) {
+      logger.error("access_token contains CR/LF, refusing to use", { resource: cred.resource })
+      return {}
+    }
+    return { Authorization: `Bearer ${cred.access_token}` }
+  }
+
+  if (cred.scheme === "basic" && cred.username !== undefined && cred.password !== undefined) {
+    // RFC 7617 §2: user-id MUST NOT contain ":" — it is used as the
+    // separator and would corrupt the credential on the server side.
+    if (cred.username.includes(":")) {
+      logger.error("basic auth username must not contain ':'", { resource: cred.resource })
+      return {}
+    }
+    // RFC 7617 §2: credentials = user-id ":" password, encoded as base64
+    // Use Buffer for proper UTF-8 support (btoa throws on non-ASCII)
+    const encoded = Buffer.from(`${cred.username}:${cred.password}`, "utf-8").toString("base64")
+    return { Authorization: `Basic ${encoded}` }
+  }
+
+  return {}
+}
+
+// ---------------------------------------------------------------------------
+// Token refresh — RFC 6749 §6
+// ---------------------------------------------------------------------------
+
+/**
  * Refresh an expired OAuth token using the refresh_token grant.
  *
  * Per RFC 6749 §6, the refresh request includes:
@@ -153,7 +146,12 @@ export function expired(cred: Credential): boolean {
  *
  * @see https://www.rfc-editor.org/rfc/rfc6749.html#section-6
  */
-export async function refresh(cred: Credential, metadata: ASMetadata): Promise<Credential | undefined> {
+export async function refresh(
+  cred: Credential,
+  metadata: ASMetadata,
+  store: CredentialStore,
+  logger: Logger = noopLogger,
+): Promise<Credential | undefined> {
   if (!cred.refresh_token || !metadata.token_endpoint) return undefined
   if (!requireHttps(metadata.token_endpoint)) return undefined
 
@@ -167,7 +165,7 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
   if (cred.oauth_client_id) body.set("client_id", cred.oauth_client_id)
   if (cred.oauth_client_secret) body.set("client_secret", cred.oauth_client_secret)
 
-  log.info("refreshing token", { resource: cred.resource, issuer: cred.issuer })
+  logger.info("refreshing token", { resource: cred.resource, issuer: cred.issuer })
 
   // redirect: "error" prevents a malicious AS from redirecting the refresh
   // POST to an internal service, leaking refresh tokens, client secrets,
@@ -180,7 +178,7 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
   }).catch(() => undefined)
 
   if (!response || !response.ok) {
-    log.error("token refresh failed", { status: response?.status, resource: cred.resource })
+    logger.error("token refresh failed", { status: response?.status, resource: cred.resource })
     return undefined
   }
 
@@ -197,7 +195,7 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
   // RFC 6749 §5.1: token_type is REQUIRED and MUST be "Bearer" (case-insensitive).
   // Consistent with the validation in flow.ts for initial token exchanges.
   if (!tokens.token_type || tokens.token_type.toLowerCase() !== "bearer") {
-    log.error("refresh token response missing or unsupported token_type", {
+    logger.error("refresh token response missing or unsupported token_type", {
       type: tokens.token_type,
       resource: cred.resource,
     })
@@ -212,53 +210,24 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
     scope: tokens.scope ?? cred.scope,
   }
 
-  await set(cred.resource, updated)
+  await store.set(cred.resource, updated)
   return updated
 }
 
-/**
- * Build Authorization header value from a credential.
- *
- * RFC 6750 §2.1: Bearer token in Authorization header
- * RFC 7617 §2: Basic credentials as base64(user-id ":" password)
- *
- * Uses Buffer.from() for Basic auth to properly handle UTF-8 encoding
- * per RFC 7617 §2.1, unlike btoa() which throws on non-ASCII.
- */
-export function headers(cred: Credential): Record<string, string> {
-  if (cred.scheme === "bearer" && cred.access_token) {
-    // Defense-in-depth: reject tokens containing CR/LF characters.
-    // Modern fetch() implementations reject CRLF in header values, but
-    // this provides an additional layer against header injection.
-    if (/[\r\n]/.test(cred.access_token)) {
-      log.error("access_token contains CR/LF, refusing to use", { resource: cred.resource })
-      return {}
-    }
-    return { Authorization: `Bearer ${cred.access_token}` }
-  }
-
-  if (cred.scheme === "basic" && cred.username !== undefined && cred.password !== undefined) {
-    // RFC 7617 §2: user-id MUST NOT contain ":" — it is used as the
-    // separator and would corrupt the credential on the server side.
-    if (cred.username.includes(":")) {
-      log.error("basic auth username must not contain ':'", { resource: cred.resource })
-      return {}
-    }
-    // RFC 7617 §2: credentials = user-id ":" password, encoded as base64
-    // Use Buffer for proper UTF-8 support (btoa throws on non-ASCII)
-    const encoded = Buffer.from(`${cred.username}:${cred.password}`, "utf-8").toString("base64")
-    return { Authorization: `Basic ${encoded}` }
-  }
-
-  return {}
-}
+// ---------------------------------------------------------------------------
+// Credential resolution — Layer 1
+// ---------------------------------------------------------------------------
 
 /**
  * Look up stored credentials for a URL and return auth headers.
  * Automatically refreshes expired tokens when a refresh_token is available.
  */
-export async function resolve(url: string): Promise<Record<string, string>> {
-  const cred = await get(url).catch(() => undefined)
+export async function resolveCredentials(
+  url: string,
+  store: CredentialStore,
+  logger: Logger = noopLogger,
+): Promise<Record<string, string>> {
+  const cred = await lookup(url, store).catch(() => undefined)
   if (!cred) return {}
 
   if (expired(cred) && cred.refresh_token && cred.issuer) {
@@ -269,20 +238,20 @@ export async function resolve(url: string): Promise<Record<string, string>> {
     const issuerUrl = requireHttps(cred.issuer)
     if (!issuerUrl) return {}
     if (!isLoopback(issuerUrl.hostname) && await isPrivateNetwork(issuerUrl.hostname)) {
-      log.error("stored issuer targets private network, skipping refresh", {
+      logger.error("stored issuer targets private network, skipping refresh", {
         resource: cred.resource,
         issuer: cred.issuer,
       })
       return {}
     }
 
-    const as = await fetchASMetadata(cred.issuer)
+    const as = await fetchASMetadata(cred.issuer, undefined, { logger })
     if (as) {
-      const refreshed = await refresh(cred, as)
-      if (refreshed) return headers(refreshed)
+      const refreshed = await refresh(cred, as, store, logger)
+      if (refreshed) return headers(refreshed, logger)
     }
   }
 
-  if (!expired(cred)) return headers(cred)
+  if (!expired(cred)) return headers(cred, logger)
   return {}
 }

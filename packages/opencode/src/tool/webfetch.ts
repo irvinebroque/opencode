@@ -4,12 +4,61 @@ import { Tool } from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { abortAfterAny } from "../util/abort"
-import * as WebFetchAuth from "../auth/webfetch-auth"
-import { handleAuth } from "../auth/orchestrate"
+import { Log } from "../util/log"
+import { resolveCredentials } from "../auth/webfetch-auth"
+import { handleAuthChallenge } from "../auth/orchestrate"
+import { FileCredentialStore } from "../auth/store"
+import { LocalCallbackServer, escapeHtml, type Interaction } from "../auth/flow"
+
+const log = Log.create({ service: "webfetch" })
+const store = new FileCredentialStore()
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
+
+const OPENCODE_SUCCESS_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <title>OpenCode - Authorization Successful</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { color: #4ade80; margin-bottom: 1rem; }
+    p { color: #aaa; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Authorization Successful</h1>
+    <p>You can close this window and return to OpenCode.</p>
+  </div>
+  <script>setTimeout(() => window.close(), 2000);</script>
+</body>
+</html>`
+
+function opencodeErrorHtml(error: string): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <title>OpenCode - Authorization Failed</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { color: #f87171; margin-bottom: 1rem; }
+    p { color: #aaa; }
+    .error { color: #fca5a5; font-family: monospace; margin-top: 1rem; padding: 1rem; background: rgba(248,113,113,0.1); border-radius: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Authorization Failed</h1>
+    <p>An error occurred during authorization.</p>
+    <div class="error">${escapeHtml(error)}</div>
+  </div>
+</body>
+</html>`
+}
 
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
@@ -72,8 +121,8 @@ export const WebFetchTool = Tool.define(
                 "Accept-Language": "en-US,en;q=0.9",
               }
 
-              // Resolve stored credentials (local file lookup, no network calls)
-              const auth = await WebFetchAuth.resolve(params.url)
+              // Layer 1: resolve stored credentials (local lookup, auto-refresh)
+              const auth = await resolveCredentials(params.url, store, log)
 
               const initial = await fetch(params.url, { signal, headers: { ...headers, ...auth } })
 
@@ -82,13 +131,65 @@ export const WebFetchTool = Tool.define(
                   ? await fetch(params.url, { signal, headers: { ...headers, ...auth, "User-Agent": "opencode" } })
                   : initial
 
-              // Clear the request timeout before entering the interactive OAuth flow.
               const tryAuth = response.status === 401 || (response.status === 403 && response.headers.has("www-authenticate"))
               if (!response.ok && tryAuth) {
                 clearTimeout()
-                const authed = await handleAuth(response, params.url, headers, ctx.abort, (opts) =>
-                  Effect.runPromise(ctx.ask(opts)),
-                )
+
+                const interaction: Interaction = {
+                  async askConsent(info) {
+                    const data: Record<string, string> = {
+                      url: params.url,
+                      action: "authenticate",
+                      server: info.server,
+                      scopes: (info.scopes?.join(", ") ?? "default") + " (server-reported, unverified)",
+                    }
+                    if (new URL(params.url).origin !== new URL(info.server).origin) {
+                      data.warning =
+                        `Cross-origin auth: ${new URL(params.url).host} directs authentication to ${new URL(info.server).host}. ` +
+                        `The resulting token will be sent to ${new URL(params.url).host}.`
+                    }
+                    await Effect.runPromise(
+                      ctx.ask({
+                        permission: "webfetch",
+                        patterns: [params.url],
+                        always: [new URL(params.url).origin + "/*"],
+                        metadata: data,
+                      }),
+                    )
+                  },
+                  async openUrl(url) {
+                    const open =
+                      process.platform === "darwin"
+                        ? "open"
+                        : process.platform === "win32"
+                          ? "start"
+                          : "xdg-open"
+                    Bun.spawn([open, url], { stdout: "ignore", stderr: "ignore" })
+                  },
+                  async showDeviceCode(info) {
+                    log.info("device code flow", {
+                      uri: info.verification_uri,
+                      code: info.user_code,
+                    })
+                  },
+                }
+
+                const authed = await handleAuthChallenge({
+                  response,
+                  url: params.url,
+                  baseHeaders: headers,
+                  signal: ctx.abort,
+                  store,
+                  interaction,
+                  callbackServer: new LocalCallbackServer({
+                    html: {
+                      success: OPENCODE_SUCCESS_HTML,
+                      error: opencodeErrorHtml,
+                    },
+                  }),
+                  client: { name: "OpenCode", uri: "https://opencode.ai" },
+                  logger: log,
+                })
                 if (authed) response = authed
               } else {
                 clearTimeout()

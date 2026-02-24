@@ -137,7 +137,7 @@ describe("register() (RFC 7591)", () => {
       issuer: "https://as.example.com",
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "TestApp" })
     expect(result).toBeUndefined()
   })
 
@@ -168,7 +168,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     expect(result).toBeDefined()
     expect(result!.client_id).toBe("test-client-id")
     expect(result!.client_secret).toBe("test-client-secret")
@@ -191,7 +191,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     expect(result).toBeDefined()
     expect(result!.client_id).toBe("public-client-id")
     expect(result!.client_secret).toBeUndefined()
@@ -214,7 +214,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     expect(result).toBeUndefined()
   })
 
@@ -224,7 +224,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: "http://127.0.0.1:1/register",
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     expect(result).toBeUndefined()
   })
 
@@ -249,7 +249,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     // Must reject — we have no renewal mechanism for expiring secrets
     expect(result).toBeUndefined()
   })
@@ -275,7 +275,7 @@ describe("register() (RFC 7591)", () => {
       registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     // expires_at=0 means "does not expire" — must accept
     expect(result).toBeDefined()
     expect(result!.client_id).toBe("permanent-client")
@@ -784,7 +784,7 @@ describe("redirect blocking on operational endpoint fetches", () => {
       registration_endpoint: `http://127.0.0.1:${redirector.port as number}/register`,
       response_types_supported: ["code"],
     }
-    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    const result = await register(meta, "http://127.0.0.1:19877/callback", { name: "OpenCode", uri: "https://opencode.ai" })
     // Must fail — redirect: "error" causes fetch to throw, caught by .catch()
     expect(result).toBeUndefined()
     // The redirect target must never have been contacted

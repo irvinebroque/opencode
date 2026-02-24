@@ -24,25 +24,239 @@
  * @see https://www.rfc-editor.org/rfc/rfc7591.html
  */
 
-import { Log } from "../util/log"
-import { requireHttps, isLoopback, type ASMetadata, type ResourceMetadata } from "./discovery"
+import { createServer, type Server } from "node:http"
+import { requireHttps, isLoopback, noopLogger, type ASMetadata, type ResourceMetadata, type Logger } from "./discovery"
 
-const log = Log.create({ service: "webfetch.flow" })
+// ---------------------------------------------------------------------------
+// Interaction interface — user-facing touchpoints
+// ---------------------------------------------------------------------------
 
-const CALLBACK_PORT = 19877
-const CALLBACK_PATH = "/webfetch/oauth/callback"
-const CALLBACK_TIMEOUT = 5 * 60 * 1000 // 5 minutes
+export interface Interaction {
+  /** Ask user for consent before authenticating. Reject to deny. */
+  askConsent(info: { resource: string; server: string; scopes?: string[] }): Promise<void>
+
+  /** The user needs to visit this URL to authorize. The consumer decides how. */
+  openUrl(url: string): Promise<void>
+
+  /** A device code flow requires the user to visit a URL and enter a code. */
+  showDeviceCode(info: { verification_uri: string; user_code: string }): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// CallbackServer interface — OAuth redirect receiver
+// ---------------------------------------------------------------------------
+
+export interface CallbackServer {
+  /** Start the server. Returns the redirect URI the AS should send the user back to. */
+  start(): Promise<{ redirectUri: string }>
+
+  /**
+   * Wait for the authorization code callback.
+   * The implementation is responsible for state/CSRF validation.
+   * Must reject on timeout or error. Must call stop() internally on completion.
+   */
+  waitForCode(expectedState: string): Promise<string>
+
+  /** Stop the server and clean up. Safe to call multiple times. */
+  stop(): Promise<void>
+}
+
+// ---------------------------------------------------------------------------
+// ClientRegistration — client identity for dynamic registration
+// ---------------------------------------------------------------------------
+
+export interface ClientRegistration {
+  name: string
+  uri?: string
+  clientId?: string
+  clientSecret?: string
+}
+
+// ---------------------------------------------------------------------------
+// LocalCallbackServer — default CallbackServer using node:http
+// ---------------------------------------------------------------------------
+
+export interface LocalCallbackServerOptions {
+  port?: number
+  hostname?: string
+  path?: string
+  portRetries?: number
+  timeout?: number
+  html?: {
+    success?: string
+    error?: (msg: string) => string
+  }
+}
 
 /**
- * Maximum device code grant lifetime in seconds.
- *
- * RFC 8628 does not define an upper bound for expires_in, so a malicious AS
- * could return an absurdly large value (e.g. 999999999 ≈ 31 years) causing
- * the poll loop to run effectively forever. Cap at 10 minutes which covers
- * all mainstream providers (GitHub 15 min, Azure 15 min, Google 30 min use
- * shorter user_code lifetimes in practice) while preventing abuse.
+ * Escape HTML special characters to prevent XSS injection.
+ * Error messages from authorization servers are untrusted input and
+ * MUST be escaped before interpolation into HTML.
  */
-export const MAX_DEVICE_CODE_LIFETIME = 600
+export function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+}
+
+const DEFAULT_SUCCESS_HTML = `<!DOCTYPE html>
+<html>
+<head>
+  <title>Authorization Successful</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { color: #4ade80; margin-bottom: 1rem; }
+    p { color: #aaa; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Authorization Successful</h1>
+    <p>You can close this window and return to the application.</p>
+  </div>
+  <script>setTimeout(() => window.close(), 2000);</script>
+</body>
+</html>`
+
+function defaultErrorHtml(error: string): string {
+  return `<!DOCTYPE html>
+<html>
+<head>
+  <title>Authorization Failed</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { color: #f87171; margin-bottom: 1rem; }
+    p { color: #aaa; }
+    .error { color: #fca5a5; font-family: monospace; margin-top: 1rem; padding: 1rem; background: rgba(248,113,113,0.1); border-radius: 0.5rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Authorization Failed</h1>
+    <p>An error occurred during authorization.</p>
+    <div class="error">${escapeHtml(error)}</div>
+  </div>
+</body>
+</html>`
+}
+
+export class LocalCallbackServer implements CallbackServer {
+  private server?: Server
+  private port: number
+  private hostname: string
+  private callbackPath: string
+  private portRetries: number
+  private timeout: number
+  private successHtml: string
+  private errorHtml: (msg: string) => string
+
+  constructor(opts?: LocalCallbackServerOptions) {
+    this.port = opts?.port ?? 19877
+    this.hostname = opts?.hostname ?? "127.0.0.1"
+    this.callbackPath = opts?.path ?? "/oauth/callback"
+    this.portRetries = opts?.portRetries ?? 10
+    this.timeout = opts?.timeout ?? 300000
+    this.successHtml = opts?.html?.success ?? DEFAULT_SUCCESS_HTML
+    this.errorHtml = opts?.html?.error ?? defaultErrorHtml
+  }
+
+  async start(): Promise<{ redirectUri: string }> {
+    for (let i = 0; i < this.portRetries; i++) {
+      const candidate = this.port + i
+      try {
+        await this.listen(candidate)
+        this.port = candidate
+        return { redirectUri: `http://${this.hostname}:${candidate}${this.callbackPath}` }
+      } catch {
+        continue
+      }
+    }
+    throw new Error("could not find open port for callback server")
+  }
+
+  private listen(port: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const srv = createServer()
+      srv.on("error", reject)
+      srv.listen(port, this.hostname, () => {
+        this.server = srv
+        resolve()
+      })
+    })
+  }
+
+  waitForCode(expectedState: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.stop()
+        reject(new Error("authorization callback timed out"))
+      }, this.timeout)
+
+      this.server!.on("request", (req, res) => {
+        const url = new URL(req.url!, `http://${this.hostname}:${this.port}`)
+        if (url.pathname !== this.callbackPath) {
+          res.writeHead(404)
+          res.end("Not found")
+          return
+        }
+
+        const code = url.searchParams.get("code")
+        const state = url.searchParams.get("state")
+        const error = url.searchParams.get("error")
+        const desc = url.searchParams.get("error_description")
+
+        // CSRF check — state must match
+        if (!state || state !== expectedState) {
+          res.writeHead(400, { "Content-Type": "text/html" })
+          res.end(this.errorHtml("Invalid state parameter"))
+          return
+        }
+
+        if (error) {
+          res.writeHead(200, { "Content-Type": "text/html" })
+          res.end(this.errorHtml(desc ?? error))
+          clearTimeout(timer)
+          // Delay cleanup so the HTTP response is fully delivered
+          setTimeout(() => this.stop(), 500)
+          reject(new Error(`Authorization error: ${desc ?? error}`))
+          return
+        }
+
+        if (!code) {
+          res.writeHead(400, { "Content-Type": "text/html" })
+          res.end(this.errorHtml("No authorization code"))
+          clearTimeout(timer)
+          setTimeout(() => this.stop(), 500)
+          reject(new Error("No authorization code in callback"))
+          return
+        }
+
+        res.writeHead(200, { "Content-Type": "text/html" })
+        res.end(this.successHtml)
+        clearTimeout(timer)
+        // Delay cleanup so the HTTP response is fully delivered to the browser
+        // before the server shuts down. Without this, the user sees a connection
+        // reset error instead of the success/error page.
+        setTimeout(() => this.stop(), 500)
+        resolve(code)
+      })
+    })
+  }
+
+  async stop(): Promise<void> {
+    if (!this.server) return
+    const srv = this.server
+    this.server = undefined
+    return new Promise((resolve) => {
+      srv.close(() => resolve())
+    })
+  }
+}
 
 // ---------------------------------------------------------------------------
 // PKCE — RFC 7636 §4.1-§4.2
@@ -113,16 +327,18 @@ export type TokenResult = {
 export async function register(
   metadata: ASMetadata,
   redirectUri: string,
+  registration: ClientRegistration,
+  logger: Logger = noopLogger,
 ): Promise<ClientInfo | undefined> {
   if (!metadata.registration_endpoint) return undefined
 
   // Validate registration endpoint is HTTPS (or HTTP loopback)
   if (!requireHttps(metadata.registration_endpoint)) {
-    log.error("registration_endpoint must be HTTPS", { url: metadata.registration_endpoint })
+    logger.error("registration_endpoint must be HTTPS", { url: metadata.registration_endpoint })
     return undefined
   }
 
-  log.info("attempting dynamic client registration", { endpoint: metadata.registration_endpoint })
+  logger.info("attempting dynamic client registration", { endpoint: metadata.registration_endpoint })
 
   // redirect: "error" prevents a malicious AS from redirecting the POST to an
   // internal service, which would forward client metadata to the redirect target.
@@ -132,8 +348,8 @@ export async function register(
     redirect: "error",
     body: JSON.stringify({
       redirect_uris: [redirectUri],
-      client_name: "OpenCode",
-      client_uri: "https://opencode.ai",
+      client_name: registration.name,
+      ...(registration.uri && { client_uri: registration.uri }),
       grant_types: ["authorization_code", "refresh_token"],
       response_types: ["code"],
       token_endpoint_auth_method: "none",
@@ -141,7 +357,7 @@ export async function register(
   }).catch(() => undefined)
 
   if (!response || !response.ok) {
-    log.info("dynamic registration failed", { status: response?.status })
+    logger.info("dynamic registration failed", { status: response?.status })
     return undefined
   }
 
@@ -154,77 +370,27 @@ export async function register(
   // expiring secret, reject it because we have no renewal mechanism.
   // A value of 0 means the secret does not expire.
   if (body.client_secret_expires_at && body.client_secret_expires_at > 0) {
-    log.info("dynamic registration returned expiring client_secret, rejecting", {
+    logger.info("dynamic registration returned expiring client_secret, rejecting", {
       client_id: body.client_id,
       expires_at: body.client_secret_expires_at,
     })
     return undefined
   }
 
-  log.info("dynamic registration succeeded", { client_id: body.client_id })
+  logger.info("dynamic registration succeeded", { client_id: body.client_id })
   return { client_id: body.client_id, client_secret: body.client_secret }
 }
 
-// ---------------------------------------------------------------------------
-// HTML pages for callback server
-// ---------------------------------------------------------------------------
-
 /**
- * Escape HTML special characters to prevent XSS injection.
- * Error messages from authorization servers are untrusted input and
- * MUST be escaped before interpolation into HTML.
+ * Maximum device code grant lifetime in seconds.
+ *
+ * RFC 8628 does not define an upper bound for expires_in, so a malicious AS
+ * could return an absurdly large value (e.g. 999999999 ≈ 31 years) causing
+ * the poll loop to run effectively forever. Cap at 10 minutes which covers
+ * all mainstream providers (GitHub 15 min, Azure 15 min, Google 30 min use
+ * shorter user_code lifetimes in practice) while preventing abuse.
  */
-function escapeHtml(str: string): string {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;")
-}
-
-const HTML_SUCCESS = `<!DOCTYPE html>
-<html>
-<head>
-  <title>OpenCode - Authorization Successful</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
-    .container { text-align: center; padding: 2rem; }
-    h1 { color: #4ade80; margin-bottom: 1rem; }
-    p { color: #aaa; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Authorization Successful</h1>
-    <p>You can close this window and return to OpenCode.</p>
-  </div>
-  <script>setTimeout(() => window.close(), 2000);</script>
-</body>
-</html>`
-
-function htmlError(error: string): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <title>OpenCode - Authorization Failed</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
-    .container { text-align: center; padding: 2rem; }
-    h1 { color: #f87171; margin-bottom: 1rem; }
-    p { color: #aaa; }
-    .error { color: #fca5a5; font-family: monospace; margin-top: 1rem; padding: 1rem; background: rgba(248,113,113,0.1); border-radius: 0.5rem; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Authorization Failed</h1>
-    <p>An error occurred during authorization.</p>
-    <div class="error">${escapeHtml(error)}</div>
-  </div>
-</body>
-</html>`
-}
+export const MAX_DEVICE_CODE_LIFETIME = 600
 
 // ---------------------------------------------------------------------------
 // Token response type — RFC 6749 §5.1-§5.2
@@ -248,15 +414,12 @@ type TokenResponse = {
 /**
  * Execute the Authorization Code + PKCE flow.
  *
- * 1. Start a local callback server on an available port
- * 2. Build the authorization URL with PKCE challenge and state
- * 3. Open the browser for user authorization
- * 4. Wait for the callback with the authorization code
- * 5. Exchange the code for tokens at the token endpoint
- *
- * The redirect_uri is built AFTER the server starts to ensure the port
- * matches the actual listening port (fixes port mismatch bug when
- * CALLBACK_PORT is already in use).
+ * 1. Start the callback server to get the redirect URI
+ * 2. Register the client if needed (deferred until port is known)
+ * 3. Build the authorization URL with PKCE challenge and state
+ * 4. Open the URL via the Interaction interface
+ * 5. Wait for the callback with the authorization code
+ * 6. Exchange the code for tokens at the token endpoint
  *
  * @see https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1
  * @see https://www.rfc-editor.org/rfc/rfc7636.html
@@ -267,8 +430,16 @@ export async function authorizationCode(
   resourceMeta: ResourceMetadata,
   asMeta: ASMetadata,
   client: ClientInfo | undefined,
-  scopes?: string[],
+  scopes: string[] | undefined,
+  opts: {
+    server: CallbackServer
+    interaction: Interaction
+    registration: ClientRegistration
+    logger?: Logger
+  },
 ): Promise<TokenResult | undefined> {
+  const log = opts.logger ?? noopLogger
+
   if (!asMeta.authorization_endpoint || !asMeta.token_endpoint) {
     log.error("AS missing required endpoints", { issuer: asMeta.issuer })
     return undefined
@@ -289,44 +460,72 @@ export async function authorizationCode(
   const st = state()
   const scope = scopes?.join(" ") ?? resourceMeta.scopes_supported?.join(" ") ?? ""
 
-  // Capture a mutable client reference — registration is deferred until the
-  // callback server binds to a port so the redirect_uri matches (#6).
   let resolved = client
 
-  // Start callback server FIRST to get the actual port, then register/build URL
-  const result = await callbackServer(st, async (port) => {
-    // Deferred registration: register with the actual port the server bound to
-    if (!resolved && asMeta.registration_endpoint) {
-      const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
-      resolved = (await register(asMeta, redirectUri)) ?? undefined
-    }
-    if (!resolved) {
-      log.error("no client available for authorization code flow")
-      return undefined
-    }
+  // Start callback server FIRST to get the actual redirect URI
+  let redirectUri: string
+  try {
+    const started = await opts.server.start()
+    redirectUri = started.redirectUri
+  } catch (err) {
+    log.error("failed to start callback server", { error: String(err) })
+    return undefined
+  }
 
-    const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
-    const params = new URLSearchParams({
-      response_type: "code",
-      client_id: resolved.client_id,
-      redirect_uri: redirectUri,
-      state: st,
-      code_challenge: codes.challenge,
-      code_challenge_method: "S256",
-    })
-    if (scope) params.set("scope", scope)
-    // RFC 8707: request audience-restricted tokens
-    params.set("resource", resourceMeta.resource)
-    return `${asMeta.authorization_endpoint}?${params.toString()}`
+  // Deferred registration: register with the actual redirect URI
+  if (!resolved && asMeta.registration_endpoint) {
+    resolved = (await register(asMeta, redirectUri, opts.registration, log)) ?? undefined
+  }
+  if (!resolved) {
+    log.error("no client available for authorization code flow")
+    await opts.server.stop()
+    return undefined
+  }
+
+  // Build authorization URL
+  const params = new URLSearchParams({
+    response_type: "code",
+    client_id: resolved.client_id,
+    redirect_uri: redirectUri,
+    state: st,
+    code_challenge: codes.challenge,
+    code_challenge_method: "S256",
   })
-  if (!result || !resolved) return undefined
+  if (scope) params.set("scope", scope)
+  // RFC 8707: request audience-restricted tokens
+  params.set("resource", resourceMeta.resource)
+  const authUrl = `${asMeta.authorization_endpoint}?${params.toString()}`
 
-  const redirectUri = `http://127.0.0.1:${result.port}${CALLBACK_PATH}`
+  // Validate authorization URL scheme before opening.
+  // A malicious authorization_endpoint (e.g. file:///..., custom-scheme://...)
+  // could trigger unintended behavior via the OS URL handler.
+  const authOrigin = new URL(authUrl).hostname
+  if (!authUrl.startsWith("https://") && !(authUrl.startsWith("http://") && isLoopback(authOrigin))) {
+    log.error("authorization URL must use HTTPS", { url: authUrl })
+    await opts.server.stop()
+    return undefined
+  }
+
+  // Open URL via the Interaction interface — consumer decides how
+  await opts.interaction.openUrl(authUrl)
+
+  // Log only the host — the full URL contains the state parameter and
+  // code_challenge which, while not secret, could be exploited by an
+  // attacker with access to aggregated logs + the callback server.
+  log.info("opened authorization URL", { host: new URL(authUrl).host })
+
+  // Wait for the callback with the authorization code
+  let code: string
+  try {
+    code = await opts.server.waitForCode(st)
+  } catch {
+    return undefined
+  }
 
   // Exchange code for tokens — RFC 6749 §4.1.3
   const body = new URLSearchParams({
     grant_type: "authorization_code",
-    code: result.code,
+    code,
     redirect_uri: redirectUri,
     client_id: resolved.client_id,
     code_verifier: codes.verifier,
@@ -407,7 +606,10 @@ export async function deviceCode(
   asMeta: ASMetadata,
   client: ClientInfo,
   scopes?: string[],
+  logger?: Logger,
 ): Promise<{ info: DeviceInfo; poll: () => Promise<TokenResult | undefined> } | undefined> {
+  const log = logger ?? noopLogger
+
   if (!asMeta.device_authorization_endpoint || !asMeta.token_endpoint) {
     log.info("AS does not support device code flow", { issuer: asMeta.issuer })
     return undefined
@@ -506,7 +708,7 @@ export async function deviceCode(
 
   async function poll(): Promise<TokenResult | undefined> {
     while (Date.now() < deadline) {
-      await Bun.sleep(interval)
+      await new Promise<void>((r) => setTimeout(r, interval))
 
       const body = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -573,150 +775,4 @@ export async function deviceCode(
   }
 
   return { info, poll }
-}
-
-// ---------------------------------------------------------------------------
-// Local callback server for authorization code flow
-// ---------------------------------------------------------------------------
-
-type CallbackResult = { code: string; port: number }
-
-/**
- * Start a local HTTP callback server, open the browser, and wait for the
- * authorization code callback.
- *
- * The buildAuthUrl callback receives the actual port the server is listening
- * on, ensuring the redirect_uri always matches. This prevents the port mismatch
- * bug where the URL encodes port 19877 but the server is on 19878+.
- *
- * The callback is async to support deferred client registration — registration
- * must happen after the port is known so the redirect_uri matches.
- *
- * @param expected - Expected state parameter for CSRF validation
- * @param buildAuthUrl - Async callback that receives actual port, returns the authorization URL
- */
-async function callbackServer(
-  expected: string,
-  buildAuthUrl: (port: number) => Promise<string | undefined>,
-): Promise<CallbackResult | undefined> {
-  // Server reference is scoped to this closure — not module-level — to prevent
-  // concurrent OAuth flows from clobbering each other's server reference.
-  let srv: ReturnType<typeof Bun.serve> | undefined
-  let timer: ReturnType<typeof setTimeout> | undefined
-  let port = CALLBACK_PORT
-
-  let resolve: (value: CallbackResult | undefined) => void
-  const promise = new Promise<CallbackResult | undefined>((r) => {
-    resolve = r
-  })
-
-  function cleanup() {
-    if (timer) clearTimeout(timer)
-    if (srv) {
-      srv.stop()
-      srv = undefined
-    }
-  }
-
-  // Try to start server, handling port conflicts.
-  // Binds to 127.0.0.1 only — not 0.0.0.0 — to prevent LAN exposure.
-  for (let i = 0; i < 10; i++) {
-    try {
-      srv = Bun.serve({
-        port,
-        hostname: "127.0.0.1",
-        fetch(req) {
-          const url = new URL(req.url)
-          if (url.pathname !== CALLBACK_PATH) {
-            return new Response("Not found", { status: 404 })
-          }
-
-          const code = url.searchParams.get("code")
-          const st = url.searchParams.get("state")
-          const error = url.searchParams.get("error")
-          const desc = url.searchParams.get("error_description")
-
-          // CSRF check — state must match
-          if (!st || st !== expected) {
-            return new Response(htmlError("Invalid state parameter"), {
-              status: 400,
-              headers: { "Content-Type": "text/html" },
-            })
-          }
-
-          // Delay cleanup so the HTTP response is fully delivered to the browser
-          // before the server shuts down. Without this, the user sees a connection
-          // reset error instead of the success/error page.
-          if (error) {
-            setTimeout(cleanup, 500)
-            resolve(undefined)
-            return new Response(htmlError(desc ?? error), {
-              headers: { "Content-Type": "text/html" },
-            })
-          }
-
-          if (!code) {
-            setTimeout(cleanup, 500)
-            resolve(undefined)
-            return new Response(htmlError("No authorization code"), {
-              status: 400,
-              headers: { "Content-Type": "text/html" },
-            })
-          }
-
-          setTimeout(cleanup, 500)
-          resolve({ code, port })
-          return new Response(HTML_SUCCESS, {
-            headers: { "Content-Type": "text/html" },
-          })
-        },
-      })
-      break
-    } catch {
-      port++
-      if (i === 9) {
-        log.error("could not find open port for callback server")
-        return undefined
-      }
-    }
-  }
-
-  // Build auth URL with the actual port (async — may perform deferred registration)
-  const authUrl = await buildAuthUrl(port)
-  if (!authUrl) {
-    cleanup()
-    return undefined
-  }
-
-  // Validate authorization URL scheme before opening in browser.
-  // A malicious authorization_endpoint (e.g. file:///..., custom-scheme://...)
-  // could trigger unintended behavior via the OS URL handler.
-  const authOrigin = new URL(authUrl).hostname
-  if (!authUrl.startsWith("https://") && !(authUrl.startsWith("http://") && isLoopback(authOrigin))) {
-    log.error("authorization URL must use HTTPS", { url: authUrl })
-    cleanup()
-    return undefined
-  }
-
-  // Open browser
-  const open =
-    process.platform === "darwin"
-      ? "open"
-      : process.platform === "win32"
-        ? "start"
-        : "xdg-open"
-  Bun.spawn([open, authUrl], { stdout: "ignore", stderr: "ignore" })
-
-  // Log only the host — the full URL contains the state parameter and
-  // code_challenge which, while not secret, could be exploited by an
-  // attacker with access to aggregated logs + the callback server.
-  log.info("opened browser for authorization", { host: new URL(authUrl).host, port })
-
-  timer = setTimeout(() => {
-    log.error("authorization callback timed out")
-    cleanup()
-    resolve(undefined)
-  }, CALLBACK_TIMEOUT)
-
-  return promise
 }

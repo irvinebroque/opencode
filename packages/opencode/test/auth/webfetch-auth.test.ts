@@ -5,7 +5,8 @@
  * - Token expiry detection
  * - Authorization header generation (Bearer + Basic)
  * - UTF-8 Basic auth encoding (RFC 7617 §2.1)
- * - Token refresh via RFC 6749 §6
+ * - Token refresh via RFC 6749 §6 with resource parameter (RFC 8707 §2.2)
+ * - Token refresh token_type validation (RFC 6749 §5.1)
  * - get() lookup: exact, origin, and prefix matching
  * - resolve() auto-refresh on expired tokens
  */

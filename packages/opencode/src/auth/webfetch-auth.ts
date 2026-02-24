@@ -9,9 +9,8 @@
  */
 
 import path from "path"
-import { mkdir } from "fs/promises"
+import { mkdir, writeFile, rename } from "fs/promises"
 import { Global } from "../global"
-import { Filesystem } from "../util/filesystem"
 import { Log } from "../util/log"
 import { requireHttps, fetchASMetadata, type ASMetadata } from "./discovery"
 
@@ -48,14 +47,22 @@ export type Credential = {
 type Store = Record<string, Credential>
 
 async function load(): Promise<Store> {
-  return Filesystem.readJson<Store>(filepath).catch(() => ({}))
+  try {
+    return JSON.parse(await Bun.file(filepath).text()) as Store
+  } catch {
+    return {}
+  }
 }
 
 async function save(store: Store) {
   // Ensure parent directory exists with 0o700 so other users cannot list
   // the directory contents, even though the file itself is 0o600.
   await mkdir(path.dirname(filepath), { recursive: true, mode: 0o700 })
-  await Filesystem.writeJson(filepath, store, 0o600)
+  // Atomic write: write to a temp file then rename. Prevents credential
+  // store corruption on crash — rename() is atomic on POSIX filesystems.
+  const tmp = filepath + ".tmp"
+  await writeFile(tmp, JSON.stringify(store, null, 2), { mode: 0o600 })
+  await rename(tmp, filepath)
 }
 
 /**
@@ -68,31 +75,34 @@ async function save(store: Store) {
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html#section-3 (scope of protection)
  */
-export async function get(resource: string): Promise<Credential | undefined> {
-  const store = await load()
-  const origin = new URL(resource).origin
+export function get(resource: string): Promise<Credential | undefined> {
+  // Serialize reads with writes to prevent reading a partially-written file.
+  return serialized(async () => {
+    const store = await load()
+    const origin = new URL(resource).origin
 
-  // Exact match first
-  if (store[resource]) return store[resource]
+    // Exact match first
+    if (store[resource]) return store[resource]
 
-  // Origin match
-  if (store[origin]) return store[origin]
+    // Origin match
+    if (store[origin]) return store[origin]
 
-  // Longest prefix match — origin-aware and path-segment-boundary-aware.
-  // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
-  // 2. Key must end at a path boundary (prevents /v1 matching /v1extra)
-  let best: Credential | undefined
-  let len = 0
-  for (const [key, cred] of Object.entries(store)) {
-    if (key.length <= len || !resource.startsWith(key)) continue
-    if (!URL.canParse(key) || new URL(key).origin !== origin) continue
-    const next = resource[key.length]
-    if (!next || next === "/" || next === "?" || next === "#") {
-      best = cred
-      len = key.length
+    // Longest prefix match — origin-aware and path-segment-boundary-aware.
+    // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
+    // 2. Key must end at a path boundary (prevents /v1 matching /v1extra)
+    let best: Credential | undefined
+    let len = 0
+    for (const [key, cred] of Object.entries(store)) {
+      if (key.length <= len || !resource.startsWith(key)) continue
+      if (!URL.canParse(key) || new URL(key).origin !== origin) continue
+      const next = resource[key.length]
+      if (!next || next === "/" || next === "?" || next === "#") {
+        best = cred
+        len = key.length
+      }
     }
-  }
-  return best
+    return best
+  })
 }
 
 /**

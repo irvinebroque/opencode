@@ -6,9 +6,9 @@
  * - PKCE generation per RFC 7636 §4.1-§4.2
  * - HTML escaping for XSS prevention
  * - State generation
- * - Dynamic client registration per RFC 7591
+ * - Dynamic client registration per RFC 7591 (including expiring secret rejection)
  * - Device code polling per RFC 8628 §3.5 (slow_down interval handling)
- * - Device code expires_in clamping to MAX_DEVICE_CODE_LIFETIME
+ * - Device code expires_in validation and clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
 import { pkce, state, register, deviceCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"

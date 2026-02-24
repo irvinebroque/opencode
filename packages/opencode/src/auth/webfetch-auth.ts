@@ -13,8 +13,7 @@ import { mkdir } from "fs/promises"
 import { Global } from "../global"
 import { Filesystem } from "../util/filesystem"
 import { Log } from "../util/log"
-import type { ASMetadata } from "./discovery"
-import * as Discovery from "./discovery"
+import { requireHttps, fetchASMetadata, type ASMetadata } from "./discovery"
 
 const log = Log.create({ service: "webfetch.auth" })
 const filepath = path.join(Global.Path.data, "webfetch-auth.json")
@@ -146,6 +145,7 @@ export function expired(cred: Credential): boolean {
  */
 export async function refresh(cred: Credential, metadata: ASMetadata): Promise<Credential | undefined> {
   if (!cred.refresh_token || !metadata.token_endpoint) return undefined
+  if (!requireHttps(metadata.token_endpoint)) return undefined
 
   const body = new URLSearchParams({
     grant_type: "refresh_token",
@@ -226,7 +226,7 @@ export async function resolve(url: string): Promise<Record<string, string>> {
   if (!cred) return {}
 
   if (expired(cred) && cred.refresh_token && cred.issuer) {
-    const as = await Discovery.fetchASMetadata(cred.issuer)
+    const as = await fetchASMetadata(cred.issuer)
     if (as) {
       const refreshed = await refresh(cred, as)
       if (refreshed) return headers(refreshed)

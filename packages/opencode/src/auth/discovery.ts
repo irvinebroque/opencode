@@ -369,11 +369,10 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   const url = asMetadataUrl(issuer)
   log.info("fetching AS metadata", { url })
 
-  // RFC 8414 does NOT prohibit redirects (unlike RFC 9728 for resource metadata).
-  // AS deployments behind load balancers may legitimately redirect. Follow redirects.
+  // Reject redirects to prevent SSRF via metadata endpoint redirect to internal services.
   let response = await fetch(url, {
     headers: { Accept: "application/json" },
-    redirect: "follow",
+    redirect: "error",
     signal,
   }).catch(() => undefined)
 
@@ -383,7 +382,7 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     log.info("trying OIDC discovery fallback", { url: fallback })
     response = await fetch(fallback, {
       headers: { Accept: "application/json" },
-      redirect: "follow",
+      redirect: "error",
       signal,
     }).catch(() => undefined)
   }

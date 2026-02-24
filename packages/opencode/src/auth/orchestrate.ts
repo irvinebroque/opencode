@@ -1,5 +1,5 @@
 /**
- * Auth orchestration for webfetch.
+ * Auth orchestration for webfetch — Layer 2.
  *
  * Handles the full OAuth flow when webfetch encounters a 401/403:
  *
@@ -14,22 +14,14 @@
  * @see https://www.rfc-editor.org/rfc/rfc9728.html
  */
 
-import { Log } from "../util/log"
-import * as WebFetchAuth from "./webfetch-auth"
+import { noopLogger, type Logger } from "./discovery"
+import { lookup, headers, type CredentialStore, type Credential } from "./webfetch-auth"
 import * as WwwAuthenticate from "./www-authenticate"
 import * as Discovery from "./discovery"
 import * as Flow from "./flow"
+import type { Interaction, CallbackServer, ClientRegistration } from "./flow"
 
-const log = Log.create({ service: "webfetch.auth" })
-
-export type AskFn = (opts: {
-  permission: string
-  patterns: string[]
-  always: string[]
-  metadata: Record<string, string>
-}) => Promise<void>
-
-function credential(resource: string, tokens: Flow.TokenResult, issuer: string): WebFetchAuth.Credential {
+function credential(resource: string, tokens: Flow.TokenResult, issuer: string): Credential {
   return {
     resource,
     scheme: "bearer",
@@ -43,22 +35,34 @@ function credential(resource: string, tokens: Flow.TokenResult, issuer: string):
   }
 }
 
-export async function handleAuth(
-  response: Response,
-  url: string,
-  base: Record<string, string>,
-  signal: AbortSignal,
-  ask: AskFn,
-): Promise<Response | undefined> {
-  log.info("auth required", { url, status: response.status })
+/**
+ * Handle an auth challenge (401/403) by running the full interactive OAuth flow.
+ *
+ * This is Layer 2: discovery, consent, browser auth or device code, token
+ * exchange, credential storage, retry. The consumer calls this explicitly
+ * when they decide to handle an auth challenge.
+ */
+export async function handleAuthChallenge(options: {
+  response: Response
+  url: string
+  baseHeaders: Record<string, string>
+  signal: AbortSignal
+  store: CredentialStore
+  interaction: Interaction
+  callbackServer?: CallbackServer
+  client?: ClientRegistration
+  logger?: Logger
+}): Promise<Response | undefined> {
+  const log = options.logger ?? noopLogger
+  log.info("auth required", { url: options.url, status: options.response.status })
 
   // 1. Parse WWW-Authenticate challenges — RFC 9110 §11.6.1
   //    Extract resource_metadata URL from Bearer challenge — RFC 9728 §5.1
-  const challenges = WwwAuthenticate.all(response)
+  const challenges = WwwAuthenticate.all(options.response)
   const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
 
   // 2. Discovery — RFC 9728 §4 (resource metadata) + RFC 8414 §3 (AS metadata)
-  const result = await Discovery.discover(url, metaUrl ?? undefined, signal)
+  const result = await Discovery.discover(options.url, metaUrl ?? undefined, options.signal, log)
 
   if (!result.resource || !result.servers.length) {
     // Basic auth challenge without discovery — RFC 7617
@@ -67,11 +71,11 @@ export async function handleAuth(
       log.info("basic auth challenge detected", { realm: basic.params["realm"] })
       throw new Error(
         `This URL requires Basic authentication (realm: ${basic.params["realm"] ?? "unknown"}). ` +
-          `Configure credentials for this origin in the webfetch auth store.`,
+          `Configure credentials for this origin in the credential store.`,
       )
     }
 
-    log.info("no auth discovery available", { url, challenges: challenges.length })
+    log.info("no auth discovery available", { url: options.url, challenges: challenges.length })
     return undefined
   }
 
@@ -81,53 +85,58 @@ export async function handleAuth(
   // resource origin. A malicious server can return resource metadata
   // listing a legitimate auth provider, causing the user to authenticate
   // and then send the resulting token to the malicious server.
-  const resourceOrigin = new URL(url).origin
+  const resourceOrigin = new URL(options.url).origin
   const serverOrigin = new URL(server.issuer).origin
-  const crossOrigin = resourceOrigin !== serverOrigin
 
   // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials.
   //    Registration is NOT done here for auth code flow — it is deferred to
   //    authorizationCode() which registers after the callback server binds,
   //    ensuring the redirect_uri port matches the actual listening port.
-  let client: Flow.ClientInfo | undefined
+  let resolved: Flow.ClientInfo | undefined
 
-  const existing = await WebFetchAuth.get(url).catch(() => undefined)
-  if (existing?.oauth_client_id) {
-    client = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
+  // Use pre-configured client_id if available
+  if (options.client?.clientId) {
+    resolved = { client_id: options.client.clientId, client_secret: options.client.clientSecret }
   }
 
-  // 4. Prompt user for consent
-  await ask({
-    permission: "webfetch",
-    patterns: [url],
-    always: [new URL(url).origin + "/*"],
-    metadata: {
-      url,
-      action: "authenticate",
-      server: server.issuer,
-      scopes: (result.resource.scopes_supported?.join(", ") ?? "default") + " (server-reported, unverified)",
-      ...(crossOrigin && {
-        warning: `Cross-origin auth: ${new URL(url).host} directs authentication to ${new URL(server.issuer).host}. ` +
-          `The resulting token will be sent to ${new URL(url).host}.`,
-      }),
-    },
+  // Check store for existing client from previous auth
+  if (!resolved) {
+    const existing = await lookup(options.url, options.store).catch(() => undefined)
+    if (existing?.oauth_client_id) {
+      resolved = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
+    }
+  }
+
+  // 4. Prompt user for consent via Interaction interface
+  await options.interaction.askConsent({
+    resource: options.url,
+    server: server.issuer,
+    scopes: result.resource.scopes_supported,
   })
 
   // 5. Execute OAuth flow — RFC 6749 §4.1 (auth code) + RFC 7636 (PKCE)
   const supports = server.grant_types_supported ?? ["authorization_code"]
-  let cred: WebFetchAuth.Credential | undefined
+  let cred: Credential | undefined
 
-  if (supports.includes("authorization_code") && server.authorization_endpoint) {
+  const registration = options.client ?? { name: "OAuth Client" }
+
+  if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
     const tokens = await Flow.authorizationCode(
-      url,
+      options.url,
       result.resource,
       server,
-      client,
+      resolved,
       result.resource.scopes_supported,
+      {
+        server: options.callbackServer,
+        interaction: options.interaction,
+        registration,
+        logger: log,
+      },
     )
     if (tokens) {
       cred = credential(result.resource.resource, tokens, server.issuer)
-      await WebFetchAuth.set(result.resource.resource, cred)
+      await options.store.set(result.resource.resource, cred)
     }
   }
 
@@ -137,48 +146,62 @@ export async function handleAuth(
     supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
     server.device_authorization_endpoint
   ) {
-    // Register for device code if no client yet (device code doesn't use redirect_uri
-    // in the flow itself, so the hardcoded port is acceptable for registration metadata)
-    if (!client && server.registration_endpoint) {
-      client = (await Flow.register(server, "http://127.0.0.1:19877/webfetch/oauth/callback")) ?? undefined
+    // Register for device code if no client yet.
+    // If a CallbackServer is provided, start it to get a redirect_uri for
+    // registration, then stop it (device code doesn't use the callback server
+    // itself, but the redirect URI is needed for the registration request).
+    if (!resolved && server.registration_endpoint) {
+      if (options.callbackServer) {
+        try {
+          const { redirectUri } = await options.callbackServer.start()
+          resolved = (await Flow.register(server, redirectUri, registration, log)) ?? undefined
+          await options.callbackServer.stop()
+        } catch {
+          // If callback server fails, can't register
+        }
+      }
     }
-    if (client) {
-      const device = await Flow.deviceCode(url, result.resource, server, client, result.resource.scopes_supported)
+    if (resolved) {
+      const device = await Flow.deviceCode(
+        options.url,
+        result.resource,
+        server,
+        resolved,
+        result.resource.scopes_supported,
+        log,
+      )
       if (device) {
-        log.info("device code flow", {
-          uri: device.info.verification_uri,
-          code: device.info.user_code,
-        })
+        await options.interaction.showDeviceCode(device.info)
         const tokens = await device.poll()
         if (tokens) {
           cred = credential(result.resource.resource, tokens, server.issuer)
-          await WebFetchAuth.set(result.resource.resource, cred)
+          await options.store.set(result.resource.resource, cred)
         }
       }
     }
   }
 
   if (!cred) {
-    if (!client) {
+    if (!resolved) {
       const docs = server.service_documentation ?? server.issuer
       throw new Error(
         `This URL requires OAuth authentication via ${server.issuer}, ` +
           `but no client_id is configured and dynamic registration is not available. ` +
-          `Register a client at ${docs} and configure it in opencode.json.`,
+          `Register a client at ${docs} and configure a client_id.`,
       )
     }
-    throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
+    throw new Error(`OAuth authentication failed for ${options.url}. Please try again.`)
   }
 
   // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
   // redirect: "error" prevents the Bearer token from being forwarded to a
   // redirect target, potentially on a different origin. If the server
   // returns a 3xx, the token must not leak to the redirect destination.
-  const auth = WebFetchAuth.headers(cred)
-  const retry = await fetch(url, {
-    signal,
+  const auth = headers(cred, log)
+  const retry = await fetch(options.url, {
+    signal: options.signal,
     redirect: "error",
-    headers: { ...base, ...auth },
+    headers: { ...options.baseHeaders, ...auth },
   }).catch(() => undefined)
 
   if (retry?.ok) return retry
@@ -186,7 +209,7 @@ export async function handleAuth(
   // Remove stale credentials on retry failure so the user isn't stuck
   // with a bad token on subsequent requests. Use the canonical resource
   // identifier (same key used by set()) — not the original request URL.
-  log.error("auth retry failed, removing stale credential", { url, status: retry?.status })
-  await WebFetchAuth.remove(result.resource.resource).catch(() => {})
+  log.error("auth retry failed, removing stale credential", { url: options.url, status: retry?.status })
+  await options.store.remove(result.resource.resource).catch(() => {})
   return undefined
 }

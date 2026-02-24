@@ -16,9 +16,21 @@
  * @see https://www.rfc-editor.org/rfc/rfc8414.html
  */
 
-import { Log } from "../util/log"
+// ---------------------------------------------------------------------------
+// Logger interface — used throughout the auth package
+// ---------------------------------------------------------------------------
 
-const log = Log.create({ service: "webfetch.discovery" })
+export interface Logger {
+  info(message: string, data?: Record<string, unknown>): void
+  warn(message: string, data?: Record<string, unknown>): void
+  error(message: string, data?: Record<string, unknown>): void
+}
+
+export const noopLogger: Logger = {
+  info() {},
+  warn() {},
+  error() {},
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -515,8 +527,10 @@ export async function fetchResourceMetadata(
   url: string,
   resource: string,
   signal?: AbortSignal,
-  opts?: { allowPrivate?: boolean },
+  opts?: { allowPrivate?: boolean; logger?: Logger },
 ): Promise<ResourceMetadata | undefined> {
+  const log = opts?.logger ?? noopLogger
+
   // RFC 9728 §7.7: metadata URL must be HTTPS
   if (!requireHttps(url)) {
     log.error("resource metadata URL must be HTTPS", { url })
@@ -619,8 +633,10 @@ export async function fetchResourceMetadata(
 export async function fetchASMetadata(
   issuer: string,
   signal?: AbortSignal,
-  opts?: { allowPrivate?: boolean },
+  opts?: { allowPrivate?: boolean; logger?: Logger },
 ): Promise<ASMetadata | undefined> {
+  const log = opts?.logger ?? noopLogger
+
   // RFC 8414 §2: issuer must be HTTPS, no query/fragment
   if (!validateIssuer(issuer)) {
     log.error("invalid issuer identifier", { issuer })
@@ -798,7 +814,9 @@ export async function discover(
   resource: string,
   metadataUrl?: string,
   signal?: AbortSignal,
+  logger?: Logger,
 ): Promise<{ resource?: ResourceMetadata; servers: ASMetadata[] }> {
+  const log = logger ?? noopLogger
   const resourceHost = new URL(resource).hostname
   const local = await isPrivateNetwork(resourceHost)
 
@@ -819,7 +837,7 @@ export async function discover(
   }
 
   const probe = metadataUrl ?? resourceMetadataUrl(resource)
-  const meta = await fetchResourceMetadata(probe, resource, signal, { allowPrivate: local })
+  const meta = await fetchResourceMetadata(probe, resource, signal, { allowPrivate: local, logger })
 
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
@@ -833,7 +851,7 @@ export async function discover(
       log.error("rejecting private-network AS from public resource", { resource, issuer })
       continue
     }
-    const as = await fetchASMetadata(issuer, signal, { allowPrivate: local })
+    const as = await fetchASMetadata(issuer, signal, { allowPrivate: local, logger })
     if (as) servers.push(as)
   }
 

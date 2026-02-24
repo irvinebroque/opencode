@@ -5,60 +5,15 @@ import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { abortAfterAny } from "../util/abort"
 import { Log } from "../util/log"
-import { resolveCredentials } from "../auth/webfetch-auth"
+import { store, resolveCredentials } from "../auth/webfetch-auth"
 import { handleAuthChallenge } from "../auth/orchestrate"
-import { FileCredentialStore } from "../auth/store"
-import { LocalCallbackServer, escapeHtml, type Interaction } from "../auth/flow"
+import { LocalCallbackServer, type Interaction } from "../auth/flow"
 
 const log = Log.create({ service: "webfetch" })
-const store = new FileCredentialStore()
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
-
-const OPENCODE_SUCCESS_HTML = `<!DOCTYPE html>
-<html>
-<head>
-  <title>OpenCode - Authorization Successful</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
-    .container { text-align: center; padding: 2rem; }
-    h1 { color: #4ade80; margin-bottom: 1rem; }
-    p { color: #aaa; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Authorization Successful</h1>
-    <p>You can close this window and return to OpenCode.</p>
-  </div>
-  <script>setTimeout(() => window.close(), 2000);</script>
-</body>
-</html>`
-
-function opencodeErrorHtml(error: string): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <title>OpenCode - Authorization Failed</title>
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #1a1a2e; color: #eee; }
-    .container { text-align: center; padding: 2rem; }
-    h1 { color: #f87171; margin-bottom: 1rem; }
-    p { color: #aaa; }
-    .error { color: #fca5a5; font-family: monospace; margin-top: 1rem; padding: 1rem; background: rgba(248,113,113,0.1); border-radius: 0.5rem; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <h1>Authorization Failed</h1>
-    <p>An error occurred during authorization.</p>
-    <div class="error">${escapeHtml(error)}</div>
-  </div>
-</body>
-</html>`
-}
 
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
@@ -94,7 +49,7 @@ export const WebFetchTool = Tool.define(
 
           return yield* Effect.promise(async () => {
             const timeout = Math.min((params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
-            const { signal, clearTimeout } = abortAfterAny(timeout, ctx.abort)
+            const timer = abortAfterAny(timeout, ctx.abort)
 
             try {
               let accept = "*/*"
@@ -124,16 +79,16 @@ export const WebFetchTool = Tool.define(
               // Layer 1: resolve stored credentials (local lookup, auto-refresh)
               const auth = await resolveCredentials(params.url, store, log)
 
-              const initial = await fetch(params.url, { signal, headers: { ...headers, ...auth } })
+              const initial = await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth } })
 
               let response =
                 initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
-                  ? await fetch(params.url, { signal, headers: { ...headers, ...auth, "User-Agent": "opencode" } })
+                  ? await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth, "User-Agent": "opencode" } })
                   : initial
 
               const tryAuth = response.status === 401 || (response.status === 403 && response.headers.has("www-authenticate"))
               if (!response.ok && tryAuth) {
-                clearTimeout()
+                timer.clearTimeout()
 
                 const interaction: Interaction = {
                   async askConsent(info) {
@@ -158,14 +113,9 @@ export const WebFetchTool = Tool.define(
                     )
                   },
                   async openUrl(url) {
-                    const open =
-                      process.platform === "darwin"
-                        ? "open"
-                        : process.platform === "win32"
-                          ? "start"
-                          : "xdg-open"
-                    Bun.spawn([open, url], { stdout: "ignore", stderr: "ignore" })
+                    await (await import("open")).default(url)
                   },
+                  // TODO: integrate device code display into TUI so the user sees the code.
                   async showDeviceCode(info) {
                     log.info("device code flow", {
                       uri: info.verification_uri,
@@ -181,18 +131,13 @@ export const WebFetchTool = Tool.define(
                   signal: ctx.abort,
                   store,
                   interaction,
-                  callbackServer: new LocalCallbackServer({
-                    html: {
-                      success: OPENCODE_SUCCESS_HTML,
-                      error: opencodeErrorHtml,
-                    },
-                  }),
+                  callbackServer: new LocalCallbackServer(),
                   client: { name: "OpenCode", uri: "https://opencode.ai" },
                   logger: log,
                 })
                 if (authed) response = authed
               } else {
-                clearTimeout()
+                timer.clearTimeout()
               }
 
               if (!response.ok) {
@@ -260,7 +205,7 @@ export const WebFetchTool = Tool.define(
                   return { output: content, title, metadata: {} }
               }
             } finally {
-              clearTimeout()
+              timer.clearTimeout()
             }
           })
         }).pipe(Effect.orDie),

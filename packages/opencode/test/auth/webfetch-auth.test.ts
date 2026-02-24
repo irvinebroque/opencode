@@ -9,11 +9,10 @@
  * - Token refresh token_type validation (RFC 6749 §5.1)
  * - lookup() three-tier matching: exact, origin, and prefix matching
  * - resolveCredentials() auto-refresh on expired tokens
- * - FileCredentialStore get/set/remove
+ * - store get/set/remove
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { expired, headers, refresh, lookup, resolveCredentials } from "../../src/auth/webfetch-auth"
-import { FileCredentialStore } from "../../src/auth/store"
+import { expired, headers, refresh, lookup, resolveCredentials, store } from "../../src/auth/webfetch-auth"
 import type { Credential, CredentialStore } from "../../src/auth/webfetch-auth"
 import type { ASMetadata } from "../../src/auth/discovery"
 
@@ -26,9 +25,6 @@ class MemoryStore implements CredentialStore {
   async remove(resource: string) { delete this.data[resource] }
   async all() { return { ...this.data } }
 }
-
-// FileCredentialStore for integration tests that exercise file I/O
-const store = new FileCredentialStore()
 
 // ---------------------------------------------------------------------------
 // expired() — token expiry detection
@@ -297,10 +293,10 @@ describe("lookup() prefix matching", () => {
 })
 
 // ---------------------------------------------------------------------------
-// FileCredentialStore — integration tests for file-based persistence
+// store — integration tests for file-based persistence
 // ---------------------------------------------------------------------------
 
-describe("FileCredentialStore get/set/remove", () => {
+describe("store get/set/remove", () => {
   const keys = [
     "https://api.example.com/v1",
     "https://api.example.com/v1/deep",

@@ -14,7 +14,7 @@
  * @see https://www.rfc-editor.org/rfc/rfc9728.html
  */
 
-import { noopLogger, type Logger } from "./discovery"
+import { Log } from "../util/log"
 import { lookup, headers, type CredentialStore, type Credential } from "./webfetch-auth"
 import * as WwwAuthenticate from "./www-authenticate"
 import * as Discovery from "./discovery"
@@ -51,9 +51,9 @@ export async function handleAuthChallenge(options: {
   interaction: Interaction
   callbackServer?: CallbackServer
   client?: ClientRegistration
-  logger?: Logger
+  logger?: Log.Logger
 }): Promise<Response | undefined> {
-  const log = options.logger ?? noopLogger
+  const log = options.logger ?? Log.create({ service: "webfetch-auth" })
   log.info("auth required", { url: options.url, status: options.response.status })
 
   // 1. Parse WWW-Authenticate challenges — RFC 9110 §11.6.1

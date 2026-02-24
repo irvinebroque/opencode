@@ -16,21 +16,7 @@
  * @see https://www.rfc-editor.org/rfc/rfc8414.html
  */
 
-// ---------------------------------------------------------------------------
-// Logger interface — used throughout the auth package
-// ---------------------------------------------------------------------------
-
-export interface Logger {
-  info(message: string, data?: Record<string, unknown>): void
-  warn(message: string, data?: Record<string, unknown>): void
-  error(message: string, data?: Record<string, unknown>): void
-}
-
-export const noopLogger: Logger = {
-  info() {},
-  warn() {},
-  error() {},
-}
+import { Log } from "../util/log"
 
 // ---------------------------------------------------------------------------
 // Types
@@ -527,9 +513,9 @@ export async function fetchResourceMetadata(
   url: string,
   resource: string,
   signal?: AbortSignal,
-  opts?: { allowPrivate?: boolean; logger?: Logger },
+  opts?: { allowPrivate?: boolean; logger?: Log.Logger },
 ): Promise<ResourceMetadata | undefined> {
-  const log = opts?.logger ?? noopLogger
+  const log = opts?.logger ?? Log.create({ service: "webfetch-auth" })
 
   // RFC 9728 §7.7: metadata URL must be HTTPS
   if (!requireHttps(url)) {
@@ -633,9 +619,9 @@ export async function fetchResourceMetadata(
 export async function fetchASMetadata(
   issuer: string,
   signal?: AbortSignal,
-  opts?: { allowPrivate?: boolean; logger?: Logger },
+  opts?: { allowPrivate?: boolean; logger?: Log.Logger },
 ): Promise<ASMetadata | undefined> {
-  const log = opts?.logger ?? noopLogger
+  const log = opts?.logger ?? Log.create({ service: "webfetch-auth" })
 
   // RFC 8414 §2: issuer must be HTTPS, no query/fragment
   if (!validateIssuer(issuer)) {
@@ -814,9 +800,9 @@ export async function discover(
   resource: string,
   metadataUrl?: string,
   signal?: AbortSignal,
-  logger?: Logger,
+  logger?: Log.Logger,
 ): Promise<{ resource?: ResourceMetadata; servers: ASMetadata[] }> {
-  const log = logger ?? noopLogger
+  const log = logger ?? Log.create({ service: "webfetch-auth" })
   const resourceHost = new URL(resource).hostname
   const local = await isPrivateNetwork(resourceHost)
 

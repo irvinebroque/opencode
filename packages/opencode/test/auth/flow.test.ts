@@ -297,10 +297,133 @@ describe("deviceCode() (RFC 8628)", () => {
     }
     const result = await deviceCode("https://api.example.com/data", resource, meta, client)
     expect(result).toBeDefined()
-    // RFC 8628: verification_uri_complete takes precedence
+    // RFC 8628: verification_uri_complete takes precedence when origins match
     expect(result!.info.verification_uri).toBe("https://as.example.com/verify?code=ABCD-1234")
     expect(result!.info.user_code).toBe("ABCD-1234")
     expect(typeof result!.poll).toBe("function")
+  })
+
+  test("falls back to verification_uri when verification_uri_complete has different origin", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            device_code: "test-device-code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://as.example.com/verify",
+            // Malicious AS points to a phishing domain
+            verification_uri_complete: "https://evil.example.com/verify?code=ABCD-1234",
+            expires_in: 300,
+            interval: 5,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    // Must fall back to verification_uri, not the phishing URL
+    expect(result!.info.verification_uri).toBe("https://as.example.com/verify")
+    expect(result!.info.user_code).toBe("ABCD-1234")
+  })
+
+  test("falls back to verification_uri when verification_uri_complete is not HTTPS", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            device_code: "test-device-code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://as.example.com/verify",
+            verification_uri_complete: "http://as.example.com/verify?code=ABCD-1234",
+            expires_in: 300,
+            interval: 5,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    // http:// (non-loopback) fails requireHttps — must fall back
+    expect(result!.info.verification_uri).toBe("https://as.example.com/verify")
+  })
+
+  test("falls back to verification_uri when verification_uri_complete is unparseable", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            device_code: "test-device-code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://as.example.com/verify",
+            verification_uri_complete: "not-a-url",
+            expires_in: 300,
+            interval: 5,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    expect(result!.info.verification_uri).toBe("https://as.example.com/verify")
+  })
+
+  test("uses verification_uri when verification_uri_complete is absent", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            device_code: "test-device-code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://as.example.com/verify",
+            expires_in: 300,
+            interval: 5,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    expect(result!.info.verification_uri).toBe("https://as.example.com/verify")
   })
 
   test("slow_down increases interval cumulatively across polls (RFC 8628 §3.5)", async () => {

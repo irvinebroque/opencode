@@ -30,6 +30,17 @@ const CALLBACK_PORT = 19877
 const CALLBACK_PATH = "/webfetch/oauth/callback"
 const CALLBACK_TIMEOUT = 5 * 60 * 1000 // 5 minutes
 
+/**
+ * Maximum device code grant lifetime in seconds.
+ *
+ * RFC 8628 does not define an upper bound for expires_in, so a malicious AS
+ * could return an absurdly large value (e.g. 999999999 ≈ 31 years) causing
+ * the poll loop to run effectively forever. Cap at 10 minutes which covers
+ * all mainstream providers (GitHub 15 min, Azure 15 min, Google 30 min use
+ * shorter user_code lifetimes in practice) while preventing abuse.
+ */
+export const MAX_DEVICE_CODE_LIFETIME = 600
+
 // ---------------------------------------------------------------------------
 // PKCE — adapted from irvinebroque/http-rfc-utils src/auth/pkce.ts
 // RFC 7636 §4.1-§4.2

@@ -523,10 +523,12 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   const url = asMetadataUrl(issuer)
   log.info("fetching AS metadata", { url })
 
-  // RFC 8414 does not prohibit redirects for metadata endpoints.
+  // Block redirects to prevent SSRF — a malicious or compromised AS metadata
+  // endpoint could redirect to internal services (cloud metadata, private nets).
+  // This matches the stricter behavior used for resource metadata (RFC 9728 §3.2).
   let response = await fetch(url, {
     headers: { Accept: "application/json" },
-    redirect: "follow",
+    redirect: "error",
     signal,
   }).catch(() => undefined)
 
@@ -536,7 +538,7 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     log.info("trying OIDC discovery fallback", { url: fallback })
     response = await fetch(fallback, {
       headers: { Accept: "application/json" },
-      redirect: "follow",
+      redirect: "error",
       signal,
     }).catch(() => undefined)
   }
@@ -648,6 +650,9 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   return metadata
 }
 
+/** Cap on authorization_servers entries to prevent abuse via enumeration. */
+export const MAX_AUTHORIZATION_SERVERS = 5
+
 /**
  * Full discovery flow: given a resource URL and optional resource_metadata URL
  * from WWW-Authenticate, discover the resource metadata and AS metadata.
@@ -686,8 +691,9 @@ export async function discover(
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
 
+  const capped = meta.authorization_servers.slice(0, MAX_AUTHORIZATION_SERVERS)
   const servers: ASMetadata[] = []
-  for (const issuer of meta.authorization_servers) {
+  for (const issuer of capped) {
     // SSRF protection: reject private-network AS from public resource
     const issuerHost = new URL(issuer).hostname
     if (isPrivateNetwork(issuerHost) && !local) {

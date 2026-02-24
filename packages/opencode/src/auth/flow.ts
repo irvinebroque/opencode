@@ -149,10 +149,11 @@ export async function register(
   // expiring secret, reject it because we have no renewal mechanism.
   // A value of 0 means the secret does not expire.
   if (body.client_secret_expires_at && body.client_secret_expires_at > 0) {
-    log.info("dynamic registration returned expiring client_secret", {
+    log.info("dynamic registration returned expiring client_secret, rejecting", {
       client_id: body.client_id,
       expires_at: body.client_secret_expires_at,
     })
+    return undefined
   }
 
   log.info("dynamic registration succeeded", { client_id: body.client_id })
@@ -325,6 +326,9 @@ export async function authorizationCode(
     client_id: resolved.client_id,
     code_verifier: codes.verifier,
   })
+  // RFC 8707 §2.2: include resource parameter at the token endpoint to
+  // audience-restrict the access token. RFC 9728 §7.4 RECOMMENDS this.
+  body.set("resource", resourceMeta.resource)
   if (resolved.client_secret) body.set("client_secret", resolved.client_secret)
 
   const response = await fetch(asMeta.token_endpoint, {
@@ -436,7 +440,17 @@ export async function deviceCode(
     interval?: number
   } | undefined
 
-  if (!data || !data.device_code || !data.user_code || !data.verification_uri) return undefined
+  // RFC 8628 §3.2: device_code, user_code, verification_uri, and expires_in
+  // are all REQUIRED fields. Reject responses missing any of them.
+  if (!data || !data.device_code || !data.user_code || !data.verification_uri || data.expires_in == null) {
+    if (data) log.error("device authorization response missing required fields", {
+      has_device_code: !!data.device_code,
+      has_user_code: !!data.user_code,
+      has_verification_uri: !!data.verification_uri,
+      has_expires_in: data.expires_in != null,
+    })
+    return undefined
+  }
 
   // RFC 8628 §3.2: default polling interval is 5 seconds.
   // Clamp minimum to 1s to prevent tight-loop polling from a malicious AS.
@@ -444,7 +458,7 @@ export async function deviceCode(
 
   // Clamp expires_in to MAX_DEVICE_CODE_LIFETIME to prevent a malicious AS
   // from keeping the poll loop alive indefinitely (e.g. expires_in: 999999999).
-  const raw = data.expires_in ?? 300
+  const raw = data.expires_in
   const lifetime = Math.min(Math.max(raw, 0), MAX_DEVICE_CODE_LIFETIME)
   if (raw > MAX_DEVICE_CODE_LIFETIME) {
     log.warn("device code expires_in exceeds maximum, clamping", {
@@ -495,8 +509,9 @@ export async function deviceCode(
 
       // RFC 8628 §3.5: on connection timeout / network error, clients MUST
       // unilaterally reduce their polling frequency before retrying.
+      // Uses exponential backoff (doubling) as RECOMMENDED by the RFC.
       if (!response) {
-        interval = Math.min(interval + 5000, 60000)
+        interval = Math.min(interval * 2, 60000)
         continue
       }
 

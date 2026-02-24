@@ -350,10 +350,13 @@ describe("refresh() (RFC 6749 §6)", () => {
         expect(body.get("grant_type")).toBe("refresh_token")
         expect(body.get("refresh_token")).toBe("old-refresh-token")
         expect(body.get("client_id")).toBe("my-client")
+        // RFC 8707 §2.2: resource parameter must be included
+        expect(body.get("resource")).toBe("https://example.com")
 
         return new Response(
           JSON.stringify({
             access_token: "new-access-token",
+            token_type: "Bearer",
             refresh_token: "new-refresh-token",
             expires_in: 3600,
             scope: "read write",
@@ -391,6 +394,7 @@ describe("refresh() (RFC 6749 §6)", () => {
         return new Response(
           JSON.stringify({
             access_token: "new-access-token",
+            token_type: "Bearer",
             expires_in: 1800,
           }),
           { headers: { "Content-Type": "application/json" } },
@@ -451,7 +455,7 @@ describe("refresh() (RFC 6749 §6)", () => {
         expect(body.get("client_secret")).toBe("my-secret")
 
         return new Response(
-          JSON.stringify({ access_token: "new-token" }),
+          JSON.stringify({ access_token: "new-token", token_type: "Bearer" }),
           { headers: { "Content-Type": "application/json" } },
         )
       },
@@ -465,6 +469,88 @@ describe("refresh() (RFC 6749 §6)", () => {
       refresh_token: "refresh-me",
       oauth_client_id: "my-client",
       oauth_client_secret: "my-secret",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await refresh(cred, meta)
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("new-token")
+  })
+
+  test("rejects refresh response missing token_type (RFC 6749 §5.1)", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({ access_token: "new-token" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await refresh(cred, meta)
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects refresh response with non-Bearer token_type (RFC 6749 §5.1)", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({ access_token: "new-token", token_type: "mac" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await refresh(cred, meta)
+    expect(result).toBeUndefined()
+  })
+
+  test("accepts case-insensitive Bearer token_type in refresh (RFC 6749 §5.1)", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({ access_token: "new-token", token_type: "BEARER" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
     }
     const meta: ASMetadata = {
       issuer: "https://as.example.com",

@@ -151,6 +151,9 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
     grant_type: "refresh_token",
     refresh_token: cred.refresh_token,
   })
+  // RFC 8707 §2.2: include resource parameter in refresh requests to
+  // audience-restrict the new access token to the target resource.
+  body.set("resource", cred.resource)
   if (cred.oauth_client_id) body.set("client_id", cred.oauth_client_id)
   if (cred.oauth_client_secret) body.set("client_secret", cred.oauth_client_secret)
 
@@ -169,12 +172,23 @@ export async function refresh(cred: Credential, metadata: ASMetadata): Promise<C
 
   const tokens = (await response.json().catch(() => undefined)) as {
     access_token: string
+    token_type?: string
     refresh_token?: string
     expires_in?: number
     scope?: string
   } | undefined
 
   if (!tokens || !tokens.access_token) return undefined
+
+  // RFC 6749 §5.1: token_type is REQUIRED and MUST be "Bearer" (case-insensitive).
+  // Consistent with the validation in flow.ts for initial token exchanges.
+  if (!tokens.token_type || tokens.token_type.toLowerCase() !== "bearer") {
+    log.error("refresh token response missing or unsupported token_type", {
+      type: tokens.token_type,
+      resource: cred.resource,
+    })
+    return undefined
+  }
 
   const updated: Credential = {
     ...cred,

@@ -496,7 +496,13 @@ async function readJsonLimited(response: Response, limit: number): Promise<unkno
   }
 
   try {
-    return JSON.parse(await new Blob(chunks).text())
+    const bytes = new Uint8Array(total)
+    let off = 0
+    for (const chunk of chunks) {
+      bytes.set(chunk, off)
+      off += chunk.byteLength
+    }
+    return JSON.parse(new TextDecoder().decode(bytes))
   } catch {
     return undefined
   }

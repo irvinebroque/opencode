@@ -3,7 +3,13 @@ import { Tool } from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { abortAfterAny } from "../util/abort"
-import { resolve as resolveAuth, negotiate } from "../auth/webfetch-auth"
+import { Log } from "../util/log"
+import * as WebFetchAuth from "../auth/webfetch-auth"
+import * as WwwAuthenticate from "../auth/www-authenticate"
+import * as Discovery from "../auth/discovery"
+import * as Flow from "../auth/flow"
+
+const log = Log.create({ service: "webfetch" })
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -63,7 +69,8 @@ export const WebFetchTool = Tool.define("webfetch", {
       "Accept-Language": "en-US,en;q=0.9",
     }
 
-    const auth = await resolveAuth(params.url)
+    // Resolve pre-existing credentials before first request
+    const auth = await WebFetchAuth.resolve(params.url)
 
     const initial = await fetch(params.url, {
       signal,
@@ -79,28 +86,10 @@ export const WebFetchTool = Tool.define("webfetch", {
           })
         : initial
 
-    // Auth handling: detect 401/403 and attempt authentication
+    // Auth handling: detect 401/403 and attempt RFC 9728/8414 authentication
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      const negotiated = await negotiate(response, params.url, async (info) => {
-        await ctx.ask({
-          permission: "webfetch",
-          patterns: [params.url],
-          always: [new URL(params.url).origin + "/*"],
-          metadata: {
-            url: params.url,
-            action: "authenticate",
-            server: info.server,
-            scopes: info.scopes,
-          },
-        })
-      })
-      if (negotiated) {
-        const retry = await fetch(params.url, {
-          signal,
-          headers: { ...headers, ...negotiated },
-        })
-        if (retry.ok) response = retry
-      }
+      const authed = await handleAuth(response, params.url, headers, signal, ctx)
+      if (authed) response = authed
     }
 
     clearTimeout()
@@ -194,6 +183,136 @@ export const WebFetchTool = Tool.define("webfetch", {
   },
 })
 
+// ---------------------------------------------------------------------------
+// Auth orchestration — moved here from webfetch-auth.ts to break circular
+// import between webfetch-auth.ts <-> flow.ts.
+//
+// Flow: 401/403 -> parse WWW-Authenticate (RFC 9110 §11.6.1)
+//       -> discover resource metadata (RFC 9728)
+//       -> discover AS metadata (RFC 8414)
+//       -> dynamic client registration (RFC 7591) or use stored client
+//       -> OAuth authorization code + PKCE (RFC 7636) or device code (RFC 8628)
+//       -> retry request with credentials
+// ---------------------------------------------------------------------------
+
+async function handleAuth(
+  response: Response,
+  url: string,
+  base: Record<string, string>,
+  signal: AbortSignal,
+  ctx: Tool.Context,
+): Promise<Response | undefined> {
+  log.info("auth required", { url, status: response.status })
+
+  // 1. Parse WWW-Authenticate challenges per RFC 9110 §11.6.1
+  const challenges = WwwAuthenticate.all(response)
+  const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
+
+  // 2. RFC 9728 / RFC 8414 discovery
+  const result = await Discovery.discover(url, metaUrl ?? undefined)
+
+  if (!result.resource || !result.servers.length) {
+    // Basic auth challenge without discovery
+    const basic = challenges.find((c) => c.scheme.toLowerCase() === "basic")
+    if (basic) {
+      log.info("basic auth challenge detected", { realm: basic.params["realm"] })
+      throw new Error(
+        `This URL requires Basic authentication (realm: ${basic.params["realm"] ?? "unknown"}). ` +
+          `Configure credentials for this origin in the webfetch auth store.`,
+      )
+    }
+
+    log.info("no auth discovery available", { url, challenges: challenges.length })
+    return undefined
+  }
+
+  const server = result.servers[0]!
+
+  // 3. Resolve client credentials (stored or dynamic registration)
+  let client: Flow.ClientInfo | undefined
+
+  const existing = await WebFetchAuth.get(url).catch(() => undefined)
+  if (existing?.oauth_client_id) {
+    client = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
+  }
+
+  if (!client && server.registration_endpoint) {
+    const redirectUri = `http://127.0.0.1:19877/webfetch/oauth/callback`
+    client = (await Flow.register(server, redirectUri)) ?? undefined
+  }
+
+  if (!client) {
+    const docs = server.service_documentation ?? server.issuer
+    throw new Error(
+      `This URL requires OAuth authentication via ${server.issuer}, ` +
+        `but no client_id is configured and dynamic registration is not available. ` +
+        `Register a client at ${docs} and configure it in opencode.json.`,
+    )
+  }
+
+  // 4. Prompt user for consent
+  await ctx.ask({
+    permission: "webfetch",
+    patterns: [url],
+    always: [new URL(url).origin + "/*"],
+    metadata: {
+      url,
+      action: "authenticate",
+      server: server.issuer,
+      scopes: result.resource.scopes_supported?.join(", ") ?? "default",
+    },
+  })
+
+  // 5. Execute OAuth flow (prefer auth code + PKCE)
+  const supports = server.grant_types_supported ?? ["authorization_code"]
+  let cred: WebFetchAuth.Credential | undefined
+
+  if (supports.includes("authorization_code") && server.authorization_endpoint) {
+    cred = await Flow.authorizationCode(
+      url,
+      result.resource,
+      server,
+      client,
+      result.resource.scopes_supported,
+    )
+  }
+
+  // Fallback to device code flow (RFC 8628)
+  if (
+    !cred &&
+    supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
+    server.device_authorization_endpoint
+  ) {
+    const device = await Flow.deviceCode(url, result.resource, server, client, result.resource.scopes_supported)
+    if (device) {
+      log.info("device code flow", {
+        uri: device.info.verification_uri,
+        code: device.info.user_code,
+      })
+      cred = await device.poll()
+    }
+  }
+
+  if (!cred) {
+    throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
+  }
+
+  // 6. Retry with credentials
+  const retry = await fetch(url, {
+    signal,
+    headers: { ...base, ...WebFetchAuth.headers(cred) },
+  })
+
+  if (retry.ok) return retry
+
+  log.error("auth retry failed", { url, status: retry.status })
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// HTML processing helpers
+// ---------------------------------------------------------------------------
+
 async function extractTextFromHTML(html: string) {
   let text = ""
   let skipContent = false
@@ -237,5 +356,3 @@ function convertHTMLToMarkdown(html: string): string {
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
 }
-
-

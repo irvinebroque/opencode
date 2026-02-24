@@ -597,7 +597,7 @@ describe("fetchASMetadata validation", () => {
     expect(result).toBeUndefined()
   })
 
-  test("follows redirects for AS metadata (RFC 8414 does not prohibit them)", async () => {
+  test("rejects redirects for AS metadata (SSRF prevention)", async () => {
     let port = 0
     const s = Bun.serve({
       port: 0,
@@ -622,9 +622,9 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
+    // Redirects are blocked to prevent SSRF via malicious AS metadata endpoints
     const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
-    expect(result).toBeDefined()
-    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
   })
 
   test("falls back to OIDC discovery when RFC 8414 endpoint fails", async () => {

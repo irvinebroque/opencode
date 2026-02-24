@@ -373,7 +373,7 @@ describe("refresh() (RFC 6749 §6)", () => {
     }
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await refresh(cred, meta)
@@ -407,7 +407,7 @@ describe("refresh() (RFC 6749 §6)", () => {
     }
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await refresh(cred, meta)
@@ -435,7 +435,7 @@ describe("refresh() (RFC 6749 §6)", () => {
     }
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await refresh(cred, meta)
@@ -468,7 +468,7 @@ describe("refresh() (RFC 6749 §6)", () => {
     }
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await refresh(cred, meta)

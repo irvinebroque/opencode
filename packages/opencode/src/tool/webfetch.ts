@@ -77,6 +77,7 @@ export const WebFetchTool = Tool.define(
                 "Accept-Language": "en-US,en;q=0.9",
               }
 
+              // Local file lookup only; OAuth discovery runs after a 401/403 challenge.
               const auth = await WebFetchAuth.resolve(params.url)
 
               const initial = await fetch(params.url, {
@@ -181,11 +182,16 @@ async function handleAuth(
 ): Promise<Response | undefined> {
   log.info("auth required", { url, status: response.status })
 
+  // 1. Parse WWW-Authenticate challenges — RFC 9110 §11.6.1
+  //    Extract resource_metadata URL from Bearer challenge — RFC 9728 §5.1
   const challenges = WwwAuthenticate.all(response)
   const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
+
+  // 2. Discovery — RFC 9728 §4 (resource metadata) + RFC 8414 §3 (AS metadata)
   const result = await Discovery.discover(url, metaUrl ?? undefined)
 
   if (!result.resource || !result.servers.length) {
+    // Basic auth challenge without discovery — RFC 7617
     const basic = challenges.find((c) => c.scheme.toLowerCase() === "basic")
     if (basic) {
       log.info("basic auth challenge detected", { realm: basic.params["realm"] })
@@ -200,6 +206,8 @@ async function handleAuth(
   }
 
   const server = result.servers[0]!
+
+  // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials
   let client: Flow.ClientInfo | undefined
 
   const existing = await WebFetchAuth.get(url).catch(() => undefined)
@@ -235,6 +243,7 @@ async function handleAuth(
     }),
   )
 
+  // 5. Execute OAuth flow — RFC 6749 §4.1 (auth code) + RFC 7636 (PKCE)
   const supports = server.grant_types_supported ?? ["authorization_code"]
   let cred: WebFetchAuth.Credential | undefined
 
@@ -248,6 +257,7 @@ async function handleAuth(
     )
   }
 
+  // Fallback: Device Authorization Grant — RFC 8628 §3.1
   if (
     !cred &&
     supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
@@ -267,6 +277,7 @@ async function handleAuth(
     throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
   }
 
+  // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
   const retry = await fetch(url, {
     signal,
     headers: { ...base, ...WebFetchAuth.headers(cred) },

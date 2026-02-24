@@ -874,6 +874,121 @@ describe("isPrivateNetwork", () => {
     expect(await isPrivateNetwork("fe80::1")).toBe(true)
   })
 
+  // --- M1: IPv6 transition mechanism ranges (SSRF hardening) ---
+
+  test("blocks 6to4 addresses embedding private IPv4 (2002::/16)", async () => {
+    // 2002:a9fe:a9fe:: encodes 169.254.169.254 (AWS metadata endpoint)
+    expect(await isPrivateNetwork("2002:a9fe:a9fe::1")).toBe(true)
+    // 2002:0a00:0001:: encodes 10.0.0.1
+    expect(await isPrivateNetwork("2002:0a00:0001::")).toBe(true)
+    // 2002:c0a8:0101:: encodes 192.168.1.1
+    expect(await isPrivateNetwork("2002:c0a8:0101::")).toBe(true)
+    // 2002:7f00:0001:: encodes 127.0.0.1
+    expect(await isPrivateNetwork("2002:7f00:0001::")).toBe(true)
+    // 2002:ac10:fe01:: encodes 172.16.254.1
+    expect(await isPrivateNetwork("2002:ac10:fe01::")).toBe(true)
+  })
+
+  test("allows 6to4 addresses embedding public IPv4", async () => {
+    // 2002:0808:0808:: encodes 8.8.8.8
+    expect(await isPrivateNetwork("2002:0808:0808::")).toBe(false)
+    // 2002:0101:0101:: encodes 1.1.1.1
+    expect(await isPrivateNetwork("2002:0101:0101::")).toBe(false)
+  })
+
+  test("blocks Teredo addresses embedding private IPv4 (2001:0000::/32)", async () => {
+    // Teredo XORs the IPv4 with 0xFFFFFFFF. To embed 169.254.169.254:
+    // 169.254.169.254 = a9fe:a9fe, XOR'd = 5601:5601
+    expect(await isPrivateNetwork("2001:0000:0000:0000:0000:0000:5601:5601")).toBe(true)
+    // Embed 127.0.0.1: XOR = 80ff:fffe
+    expect(await isPrivateNetwork("2001:0000::80ff:fffe")).toBe(true)
+    // Embed 10.0.0.1: XOR = f5ff:fffe
+    expect(await isPrivateNetwork("2001:0000::f5ff:fffe")).toBe(true)
+    // Embed 192.168.1.1: XOR = 3f57:fefe
+    expect(await isPrivateNetwork("2001:0000::3f57:fefe")).toBe(true)
+  })
+
+  test("allows Teredo addresses embedding public IPv4", async () => {
+    // Embed 8.8.8.8: XOR = f7f7:f7f7
+    expect(await isPrivateNetwork("2001:0000::f7f7:f7f7")).toBe(false)
+  })
+
+  test("blocks NAT64 addresses embedding private IPv4 (64:ff9b::/96)", async () => {
+    // 64:ff9b::169.254.169.254 — AWS metadata
+    expect(await isPrivateNetwork("64:ff9b::a9fe:a9fe")).toBe(true)
+    // 64:ff9b::10.0.0.1
+    expect(await isPrivateNetwork("64:ff9b::0a00:0001")).toBe(true)
+    // 64:ff9b::127.0.0.1
+    expect(await isPrivateNetwork("64:ff9b::7f00:0001")).toBe(true)
+    // 64:ff9b::192.168.1.1
+    expect(await isPrivateNetwork("64:ff9b::c0a8:0101")).toBe(true)
+  })
+
+  test("allows NAT64 addresses embedding public IPv4", async () => {
+    // 64:ff9b::8.8.8.8
+    expect(await isPrivateNetwork("64:ff9b::0808:0808")).toBe(false)
+  })
+
+  test("blocks deprecated site-local addresses (fec0::/10)", async () => {
+    expect(await isPrivateNetwork("fec0::1")).toBe(true)
+    expect(await isPrivateNetwork("fec0:1234:5678::1")).toBe(true)
+    expect(await isPrivateNetwork("feff::1")).toBe(true)
+  })
+
+  test("blocks documentation range (2001:db8::/32)", async () => {
+    expect(await isPrivateNetwork("2001:db8::1")).toBe(true)
+    expect(await isPrivateNetwork("2001:0db8:1234::1")).toBe(true)
+    expect(await isPrivateNetwork("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")).toBe(true)
+  })
+
+  test("allows public IPv6 addresses", async () => {
+    // 2607:f8b0:4004:800::200e is a Google public address
+    expect(await isPrivateNetwork("2607:f8b0:4004:800::200e")).toBe(false)
+    // 2600:: range (public)
+    expect(await isPrivateNetwork("2600::1")).toBe(false)
+  })
+
+  // --- M2: parseV4 strict decimal parsing ---
+
+  test("rejects IPv4 with hex octets (0x7f.0.0.1)", async () => {
+    // Number("0x7f") = 127, so without strict parsing this would match 127.0.0.1
+    expect(await isPrivateNetwork("0x7f.0.0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with scientific notation (1e2.0.0.1)", async () => {
+    // Number("1e2") = 100, which falls in RFC 6598 range 100.64.0.0/10
+    expect(await isPrivateNetwork("1e2.0.0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with leading zeros (010.0.0.1)", async () => {
+    // Some systems interpret leading-zero octets as octal (010 = 8)
+    expect(await isPrivateNetwork("010.0.0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with whitespace ( 10.0.0.1)", async () => {
+    // Number(" 10") = 10, but this is not a valid IP
+    expect(await isPrivateNetwork(" 10.0.0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with empty octets (10..0.1)", async () => {
+    expect(await isPrivateNetwork("10..0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with oversized decimal octets (256.0.0.1)", async () => {
+    expect(await isPrivateNetwork("256.0.0.1")).toBe(false)
+  })
+
+  test("rejects IPv4 with negative values (-1.0.0.1)", async () => {
+    expect(await isPrivateNetwork("-1.0.0.1")).toBe(false)
+  })
+
+  test("still accepts valid decimal IPv4", async () => {
+    expect(await isPrivateNetwork("10.0.0.1")).toBe(true)
+    expect(await isPrivateNetwork("192.168.0.1")).toBe(true)
+    expect(await isPrivateNetwork("255.255.255.255")).toBe(false)
+    expect(await isPrivateNetwork("0.0.0.0")).toBe(true)
+  })
+
   // Known private hostname patterns
   test("blocks localhost and .localhost hostnames", async () => {
     expect(await isPrivateNetwork("localhost")).toBe(true)

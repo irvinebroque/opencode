@@ -88,12 +88,19 @@ export function isLoopback(hostname: string): boolean {
 // Private network detection — SSRF protection
 // ---------------------------------------------------------------------------
 
-/** Parse an IPv4 address string into 4 octets, or undefined if invalid. */
+/**
+ * Parse an IPv4 address string into 4 octets, or undefined if invalid.
+ *
+ * Uses strict decimal-only parsing to prevent mismatches between our
+ * classification and the OS resolver. Rejects hex (0x7f), octal-style
+ * leading zeros (010), scientific notation (1e2), and whitespace — all
+ * of which `Number()` would silently accept.
+ */
 function parseV4(host: string): number[] | undefined {
   const parts = host.split(".")
   if (parts.length !== 4) return undefined
-  const bytes = parts.map(Number)
-  if (bytes.some((b) => !Number.isInteger(b) || b < 0 || b > 255)) return undefined
+  const bytes = parts.map((s) => (/^(?:0|[1-9]\d{0,2})$/.test(s) ? parseInt(s, 10) : NaN))
+  if (bytes.some((b) => isNaN(b) || b > 255)) return undefined
   return bytes
 }
 
@@ -142,12 +149,29 @@ function expandV6(raw: string): number[] | undefined {
   return [...left, ...new Array(pad).fill(0), ...right]
 }
 
+/** Extract IPv4 octets from the high 16 bits of two consecutive groups. */
+function v4from(hi: number, lo: number): number[] {
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]
+}
+
 /**
  * Check whether an IP literal is a private, loopback, or link-local address.
  *
  * This is the synchronous core that only inspects IP address literals.
  * Callers that need hostname-safe SSRF checks should use {@link isPrivateNetwork}
  * which also resolves DNS names and checks well-known private hostnames.
+ *
+ * IPv6 ranges covered:
+ * - ::1            — loopback
+ * - ::             — unspecified
+ * - fc00::/7       — unique local (RFC 4193)
+ * - fe80::/10      — link-local (RFC 4291)
+ * - fec0::/10      — deprecated site-local (RFC 3879), still routable on some stacks
+ * - ::ffff:0:0/96  — IPv4-mapped, delegates to privateV4
+ * - 2002::/16      — 6to4 relay (RFC 3056), embeds IPv4 in bits 16-47
+ * - 2001:0000::/32 — Teredo (RFC 4380), embeds IPv4 XOR'd in last 32 bits
+ * - 64:ff9b::/96   — NAT64 well-known prefix (RFC 6052), embeds IPv4 in last 32 bits
+ * - 2001:db8::/32  — documentation range (RFC 3849), must never appear on the wire
  */
 function isPrivateIP(hostname: string): boolean {
   const host = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname
@@ -176,11 +200,14 @@ function isPrivateIP(hostname: string): boolean {
   // :: unspecified
   if (groups.every((g) => g === 0)) return true
 
-  // fc00::/7 unique local
+  // fc00::/7 unique local (RFC 4193)
   if ((groups[0] & 0xfe00) === 0xfc00) return true
 
-  // fe80::/10 link-local
+  // fe80::/10 link-local (RFC 4291)
   if ((groups[0] & 0xffc0) === 0xfe80) return true
+
+  // fec0::/10 deprecated site-local (RFC 3879) — still routable on some stacks
+  if ((groups[0] & 0xffc0) === 0xfec0) return true
 
   // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
   if (
@@ -191,13 +218,37 @@ function isPrivateIP(hostname: string): boolean {
     groups[4] === 0 &&
     groups[5] === 0xffff
   ) {
-    return privateV4([
-      (groups[6] >> 8) & 0xff,
-      groups[6] & 0xff,
-      (groups[7] >> 8) & 0xff,
-      groups[7] & 0xff,
-    ])
+    return privateV4(v4from(groups[6], groups[7]))
   }
+
+  // 2002::/16 — 6to4 (RFC 3056). Embeds IPv4 in bits 16-47.
+  // e.g. 2002:a9fe:a9fe:: encodes 169.254.169.254 (AWS metadata endpoint)
+  if (groups[0] === 0x2002) {
+    return privateV4(v4from(groups[1], groups[2]))
+  }
+
+  // 2001:0000::/32 — Teredo (RFC 4380). Embeds IPv4 XOR'd with 0xFFFF
+  // in the last 32 bits (groups[6] and groups[7]).
+  if (groups[0] === 0x2001 && groups[1] === 0x0000) {
+    return privateV4(v4from(groups[6] ^ 0xffff, groups[7] ^ 0xffff))
+  }
+
+  // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052).
+  // Embeds IPv4 in the last 32 bits.
+  if (
+    groups[0] === 0x0064 &&
+    groups[1] === 0xff9b &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0
+  ) {
+    return privateV4(v4from(groups[6], groups[7]))
+  }
+
+  // 2001:db8::/32 — documentation range (RFC 3849). Must never appear on
+  // the wire; block to prevent use as a bypass vector.
+  if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true
 
   return false
 }
@@ -207,7 +258,10 @@ function isPrivateIP(hostname: string): boolean {
  *
  * Used for SSRF protection to block requests targeting internal networks.
  * Covers:
- * - IP literals: RFC 1918, RFC 6598, loopback, link-local, IPv6 equivalents
+ * - IPv4: RFC 1918, RFC 6598, loopback, link-local, 0.0.0.0/8
+ * - IPv6: loopback, ULA, link-local, site-local, IPv4-mapped,
+ *   6to4 (RFC 3056), Teredo (RFC 4380), NAT64 (RFC 6052),
+ *   documentation (RFC 3849)
  * - Known private hostname patterns: localhost, .localhost, .local, .internal
  * - DNS resolution: resolves hostnames and checks all resulting IPs
  *

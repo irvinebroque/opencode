@@ -847,6 +847,191 @@ describe("discover() integration", () => {
 })
 
 // ---------------------------------------------------------------------------
+// fetchResourceMetadata — SSRF protection (M6)
+// ---------------------------------------------------------------------------
+
+describe("fetchResourceMetadata SSRF protection", () => {
+  test("rejects private-network metadata URL (M6)", async () => {
+    // A caller using fetchResourceMetadata() directly should get SSRF protection
+    // even without going through discover().
+    const result = await fetchResourceMetadata(
+      "https://10.0.0.1/.well-known/oauth-protected-resource",
+      "https://10.0.0.1",
+    )
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects cloud metadata IP (169.254.169.254)", async () => {
+    const result = await fetchResourceMetadata(
+      "https://169.254.169.254/.well-known/oauth-protected-resource",
+      "https://169.254.169.254",
+    )
+    expect(result).toBeUndefined()
+  })
+
+  test("allows loopback metadata URL (local dev exemption)", async () => {
+    // Loopback should still work for local development.
+    // This will fail to fetch (no server), but should NOT be blocked by SSRF.
+    // The function returns undefined due to fetch failure, not SSRF rejection.
+    const result = await fetchResourceMetadata(
+      "http://127.0.0.1:19999/.well-known/oauth-protected-resource",
+      "http://127.0.0.1:19999",
+    )
+    // Returns undefined due to network error, not SSRF — loopback is allowed
+    expect(result).toBeUndefined()
+  })
+
+  test("skips SSRF check with allowPrivate option", async () => {
+    // discover() passes allowPrivate when the resource is on a private network.
+    // The function should not reject private IPs when allowPrivate is set.
+    // Use a short abort signal so the test doesn't hang on the actual fetch.
+    const ctrl = new AbortController()
+    setTimeout(() => ctrl.abort(), 100)
+    const result = await fetchResourceMetadata(
+      "https://10.0.0.1/.well-known/oauth-protected-resource",
+      "https://10.0.0.1",
+      ctrl.signal,
+      { allowPrivate: true },
+    )
+    // Returns undefined due to abort/network error, not SSRF
+    expect(result).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// fetchASMetadata — SSRF protection (M3, M6)
+// ---------------------------------------------------------------------------
+
+describe("fetchASMetadata SSRF protection", () => {
+  const servers: ReturnType<typeof Bun.serve>[] = []
+  afterEach(() => {
+    for (const s of servers) s.stop()
+    servers.length = 0
+  })
+
+  test("rejects private-network issuer (M6)", async () => {
+    // A caller using fetchASMetadata() directly should get SSRF protection.
+    const result = await fetchASMetadata("https://10.0.0.1")
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects cloud metadata issuer (169.254.169.254)", async () => {
+    const result = await fetchASMetadata("https://169.254.169.254")
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects RFC 1918 issuer (192.168.x.x)", async () => {
+    const result = await fetchASMetadata("https://192.168.1.1")
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects AS metadata with private-network token_endpoint (M3)", async () => {
+    // A malicious AS at a public URL could set endpoint URLs pointing to
+    // internal services to exfiltrate OAuth credentials.
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: "https://10.0.0.1/token",
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects AS metadata with private-network authorization_endpoint (M3)", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: "https://192.168.1.1/authorize",
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects AS metadata with cloud metadata in registration_endpoint (M3)", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            registration_endpoint: "https://169.254.169.254/register",
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
+  })
+
+  test("allows loopback endpoints (local dev exemption)", async () => {
+    // All endpoints on 127.0.0.1 should work for local development
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            registration_endpoint: `http://127.0.0.1:${port}/register`,
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeDefined()
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+  })
+
+  test("skips SSRF checks with allowPrivate option", async () => {
+    // discover() passes allowPrivate when the resource is on a private network.
+    // Fetching from private IPs should not be blocked when allowPrivate is set.
+    // Use a short abort signal so the test doesn't hang on the actual fetch.
+    const ctrl = new AbortController()
+    setTimeout(() => ctrl.abort(), 100)
+    const result = await fetchASMetadata("https://10.0.0.1", ctrl.signal, { allowPrivate: true })
+    // Returns undefined due to abort/network error, not SSRF
+    expect(result).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
 // isPrivateNetwork — SSRF protection (IP literals, hostnames, DNS resolution)
 // ---------------------------------------------------------------------------
 

@@ -86,6 +86,39 @@ export function isLoopback(hostname: string): boolean {
 
 // ---------------------------------------------------------------------------
 // Private network detection — SSRF protection
+//
+// Uses the same approach as ipaddr.js: a generic CIDR matcher operating on
+// number arrays, with range tables as pure data. Tunneling protocols (6to4,
+// Teredo, NAT64, IPv4-mapped) are classified first, then the embedded IPv4
+// is extracted and re-checked against the IPv4 table.
+// ---------------------------------------------------------------------------
+
+/**
+ * Generic CIDR matcher — compares `parts` against `network` for the first
+ * `bits` bits. `partSize` is 8 for IPv4 octets, 16 for IPv6 groups.
+ *
+ * Adapted from ipaddr.js matchCIDR.
+ */
+function matchCIDR(parts: number[], network: number[], bits: number, partSize: number): boolean {
+  let i = 0
+  let remaining = bits
+  while (remaining > 0) {
+    const shift = Math.max(partSize - remaining, 0)
+    if ((parts[i] >> shift) !== (network[i] >> shift)) return false
+    remaining -= partSize
+    i++
+  }
+  return true
+}
+
+type Range = readonly [network: number[], bits: number]
+
+function matchAny(parts: number[], ranges: Range[], partSize: number): boolean {
+  return ranges.some(([net, bits]) => matchCIDR(parts, net, bits, partSize))
+}
+
+// ---------------------------------------------------------------------------
+// IPv4 parsing + range table
 // ---------------------------------------------------------------------------
 
 /**
@@ -104,17 +137,24 @@ function parseV4(host: string): number[] | undefined {
   return bytes
 }
 
-/** Check if IPv4 octets belong to a private, loopback, or link-local range. */
-function privateV4(o: number[]): boolean {
-  if (o[0] === 0) return true                                   // 0.0.0.0/8
-  if (o[0] === 10) return true                                  // 10.0.0.0/8
-  if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true   // 100.64.0.0/10 (RFC 6598)
-  if (o[0] === 127) return true                                 // 127.0.0.0/8
-  if (o[0] === 169 && o[1] === 254) return true                 // 169.254.0.0/16 (link-local / cloud metadata)
-  if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true    // 172.16.0.0/12
-  if (o[0] === 192 && o[1] === 168) return true                 // 192.168.0.0/16
-  return false
+/** IPv4 private, loopback, and link-local ranges. */
+const V4_PRIVATE: Range[] = [
+  [[0, 0, 0, 0],       8],   // 0.0.0.0/8 — "this" network
+  [[10, 0, 0, 0],      8],   // 10.0.0.0/8 — RFC 1918
+  [[100, 64, 0, 0],   10],   // 100.64.0.0/10 — RFC 6598 (carrier-grade NAT)
+  [[127, 0, 0, 0],     8],   // 127.0.0.0/8 — loopback
+  [[169, 254, 0, 0],  16],   // 169.254.0.0/16 — link-local
+  [[172, 16, 0, 0],   12],   // 172.16.0.0/12 — RFC 1918
+  [[192, 168, 0, 0],  16],   // 192.168.0.0/16 — RFC 1918
+]
+
+function isPrivateV4(octets: number[]): boolean {
+  return matchAny(octets, V4_PRIVATE, 8)
 }
+
+// ---------------------------------------------------------------------------
+// IPv6 parsing + range tables
+// ---------------------------------------------------------------------------
 
 /** Expand an IPv6 address string to 8 groups of 16-bit values. */
 function expandV6(raw: string): number[] | undefined {
@@ -149,9 +189,42 @@ function expandV6(raw: string): number[] | undefined {
   return [...left, ...new Array(pad).fill(0), ...right]
 }
 
-/** Extract IPv4 octets from the high 16 bits of two consecutive groups. */
+/** IPv6 ranges that are directly private (no embedded IPv4 to extract). */
+const V6_PRIVATE: Range[] = [
+  [[0, 0, 0, 0, 0, 0, 0, 1],          128],  // ::1 — loopback
+  [[0, 0, 0, 0, 0, 0, 0, 0],          128],  // :: — unspecified
+  [[0xfc00, 0, 0, 0, 0, 0, 0, 0],       7],  // fc00::/7 — unique local (RFC 4193)
+  [[0xfe80, 0, 0, 0, 0, 0, 0, 0],      10],  // fe80::/10 — link-local (RFC 4291)
+  [[0xfec0, 0, 0, 0, 0, 0, 0, 0],      10],  // fec0::/10 — site-local (deprecated, RFC 3879)
+  [[0x2001, 0x0db8, 0, 0, 0, 0, 0, 0], 32],  // 2001:db8::/32 — documentation (RFC 3849)
+]
+
+/** Extract IPv4 octets embedded in two 16-bit groups. */
 function v4from(hi: number, lo: number): number[] {
   return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff]
+}
+
+/**
+ * Extract an embedded IPv4 address from an IPv6 tunneling address.
+ * Returns the 4 IPv4 octets, or undefined if the address is not a
+ * tunneling type with an embedded IPv4.
+ *
+ * Tunneling protocols handled:
+ * - ::ffff:0:0/96  — IPv4-mapped, IPv4 in last 32 bits
+ * - 2002::/16      — 6to4 (RFC 3056), IPv4 in bits 16-47
+ * - 2001:0000::/32 — Teredo (RFC 4380), IPv4 XOR'd in last 32 bits
+ * - 64:ff9b::/96   — NAT64 (RFC 6052), IPv4 in last 32 bits
+ */
+function extractEmbeddedV4(groups: number[]): number[] | undefined {
+  if (matchCIDR(groups, [0, 0, 0, 0, 0, 0xffff, 0, 0], 96, 16))
+    return v4from(groups[6], groups[7])
+  if (matchCIDR(groups, [0x2002, 0, 0, 0, 0, 0, 0, 0], 16, 16))
+    return v4from(groups[1], groups[2])
+  if (matchCIDR(groups, [0x2001, 0, 0, 0, 0, 0, 0, 0], 32, 16))
+    return v4from(groups[6] ^ 0xffff, groups[7] ^ 0xffff)
+  if (matchCIDR(groups, [0x0064, 0xff9b, 0, 0, 0, 0, 0, 0], 96, 16))
+    return v4from(groups[6], groups[7])
+  return undefined
 }
 
 /**
@@ -160,95 +233,24 @@ function v4from(hi: number, lo: number): number[] {
  * This is the synchronous core that only inspects IP address literals.
  * Callers that need hostname-safe SSRF checks should use {@link isPrivateNetwork}
  * which also resolves DNS names and checks well-known private hostnames.
- *
- * IPv6 ranges covered:
- * - ::1            — loopback
- * - ::             — unspecified
- * - fc00::/7       — unique local (RFC 4193)
- * - fe80::/10      — link-local (RFC 4291)
- * - fec0::/10      — deprecated site-local (RFC 3879), still routable on some stacks
- * - ::ffff:0:0/96  — IPv4-mapped, delegates to privateV4
- * - 2002::/16      — 6to4 relay (RFC 3056), embeds IPv4 in bits 16-47
- * - 2001:0000::/32 — Teredo (RFC 4380), embeds IPv4 XOR'd in last 32 bits
- * - 64:ff9b::/96   — NAT64 well-known prefix (RFC 6052), embeds IPv4 in last 32 bits
- * - 2001:db8::/32  — documentation range (RFC 3849), must never appear on the wire
  */
 function isPrivateIP(hostname: string): boolean {
   const host = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname
 
-  // IPv4
+  // IPv4 literal
   const v4 = parseV4(host)
-  if (v4) return privateV4(v4)
+  if (v4) return isPrivateV4(v4)
 
-  // IPv6
+  // IPv6 literal
   const groups = expandV6(host.toLowerCase())
   if (!groups || groups.length !== 8) return false
 
-  // ::1 loopback
-  if (
-    groups[0] === 0 &&
-    groups[1] === 0 &&
-    groups[2] === 0 &&
-    groups[3] === 0 &&
-    groups[4] === 0 &&
-    groups[5] === 0 &&
-    groups[6] === 0 &&
-    groups[7] === 1
-  )
-    return true
+  // Direct private ranges (loopback, ULA, link-local, etc.)
+  if (matchAny(groups, V6_PRIVATE, 16)) return true
 
-  // :: unspecified
-  if (groups.every((g) => g === 0)) return true
-
-  // fc00::/7 unique local (RFC 4193)
-  if ((groups[0] & 0xfe00) === 0xfc00) return true
-
-  // fe80::/10 link-local (RFC 4291)
-  if ((groups[0] & 0xffc0) === 0xfe80) return true
-
-  // fec0::/10 deprecated site-local (RFC 3879) — still routable on some stacks
-  if ((groups[0] & 0xffc0) === 0xfec0) return true
-
-  // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
-  if (
-    groups[0] === 0 &&
-    groups[1] === 0 &&
-    groups[2] === 0 &&
-    groups[3] === 0 &&
-    groups[4] === 0 &&
-    groups[5] === 0xffff
-  ) {
-    return privateV4(v4from(groups[6], groups[7]))
-  }
-
-  // 2002::/16 — 6to4 (RFC 3056). Embeds IPv4 in bits 16-47.
-  // e.g. 2002:a9fe:a9fe:: encodes 169.254.169.254 (AWS metadata endpoint)
-  if (groups[0] === 0x2002) {
-    return privateV4(v4from(groups[1], groups[2]))
-  }
-
-  // 2001:0000::/32 — Teredo (RFC 4380). Embeds IPv4 XOR'd with 0xFFFF
-  // in the last 32 bits (groups[6] and groups[7]).
-  if (groups[0] === 0x2001 && groups[1] === 0x0000) {
-    return privateV4(v4from(groups[6] ^ 0xffff, groups[7] ^ 0xffff))
-  }
-
-  // 64:ff9b::/96 — NAT64 well-known prefix (RFC 6052).
-  // Embeds IPv4 in the last 32 bits.
-  if (
-    groups[0] === 0x0064 &&
-    groups[1] === 0xff9b &&
-    groups[2] === 0 &&
-    groups[3] === 0 &&
-    groups[4] === 0 &&
-    groups[5] === 0
-  ) {
-    return privateV4(v4from(groups[6], groups[7]))
-  }
-
-  // 2001:db8::/32 — documentation range (RFC 3849). Must never appear on
-  // the wire; block to prevent use as a bypass vector.
-  if (groups[0] === 0x2001 && groups[1] === 0x0db8) return true
+  // Tunneling protocols — extract embedded IPv4 and check it
+  const embedded = extractEmbeddedV4(groups)
+  if (embedded) return isPrivateV4(embedded)
 
   return false
 }
@@ -513,11 +515,24 @@ export async function fetchResourceMetadata(
   url: string,
   resource: string,
   signal?: AbortSignal,
+  opts?: { allowPrivate?: boolean },
 ): Promise<ResourceMetadata | undefined> {
   // RFC 9728 §7.7: metadata URL must be HTTPS
   if (!requireHttps(url)) {
     log.error("resource metadata URL must be HTTPS", { url })
     return undefined
+  }
+
+  // SSRF protection: reject metadata URLs targeting private networks.
+  // Loopback is exempted for local development (RFC 8252 §7.3).
+  // discover() passes allowPrivate when the resource itself is on a
+  // private network; standalone callers get full SSRF protection.
+  if (!opts?.allowPrivate) {
+    const host = new URL(url).hostname
+    if (!isLoopback(host) && await isPrivateNetwork(host)) {
+      log.error("resource metadata URL must not target private network", { url })
+      return undefined
+    }
   }
 
   log.info("fetching resource metadata", { url })
@@ -601,11 +616,27 @@ export async function fetchResourceMetadata(
  * Falls back to OIDC Discovery (.well-known/openid-configuration) if
  * the RFC 8414 endpoint is not available.
  */
-export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Promise<ASMetadata | undefined> {
+export async function fetchASMetadata(
+  issuer: string,
+  signal?: AbortSignal,
+  opts?: { allowPrivate?: boolean },
+): Promise<ASMetadata | undefined> {
   // RFC 8414 §2: issuer must be HTTPS, no query/fragment
   if (!validateIssuer(issuer)) {
     log.error("invalid issuer identifier", { issuer })
     return undefined
+  }
+
+  // SSRF protection: reject issuers targeting private networks.
+  // Loopback is exempted for local development (RFC 8252 §7.3).
+  // discover() passes allowPrivate when the resource itself is on a
+  // private network; standalone callers get full SSRF protection.
+  if (!opts?.allowPrivate) {
+    const host = new URL(issuer).hostname
+    if (!isLoopback(host) && await isPrivateNetwork(host)) {
+      log.error("issuer must not target private network", { issuer })
+      return undefined
+    }
   }
 
   const url = asMetadataUrl(issuer)
@@ -691,18 +722,32 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     return undefined
   }
 
-  // Validate endpoint URLs are HTTPS (or HTTP loopback per RFC 8252 §7.3).
+  // Validate endpoint URLs are HTTPS (or HTTP loopback per RFC 8252 §7.3)
+  // and do not target private networks (SSRF protection).
   // A malicious AS metadata document could set these to HTTP URLs, exposing
-  // authorization codes, PKCE verifiers, or tokens in cleartext.
+  // authorization codes, PKCE verifiers, or tokens in cleartext, or point
+  // them at internal services (e.g. https://internal.corp.example.com) to
+  // exfiltrate OAuth credentials via SSRF.
   for (const field of [
     "authorization_endpoint",
     "token_endpoint",
     "registration_endpoint",
     "device_authorization_endpoint",
   ] as const) {
-    if (metadata[field] && !requireHttps(metadata[field]!)) {
-      log.error(`AS metadata ${field} must be HTTPS`, { issuer, value: metadata[field] })
+    const val = metadata[field]
+    if (!val) continue
+    if (!requireHttps(val)) {
+      log.error(`AS metadata ${field} must be HTTPS`, { issuer, value: val })
       return undefined
+    }
+    // SSRF protection: endpoint must not target private network.
+    // Loopback is exempted for local development (RFC 8252 §7.3).
+    if (!opts?.allowPrivate) {
+      const host = new URL(val).hostname
+      if (!isLoopback(host) && await isPrivateNetwork(host)) {
+        log.error(`AS metadata ${field} must not target private network`, { issuer, value: val })
+        return undefined
+      }
     }
   }
 
@@ -774,7 +819,7 @@ export async function discover(
   }
 
   const probe = metadataUrl ?? resourceMetadataUrl(resource)
-  const meta = await fetchResourceMetadata(probe, resource, signal)
+  const meta = await fetchResourceMetadata(probe, resource, signal, { allowPrivate: local })
 
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
@@ -788,7 +833,7 @@ export async function discover(
       log.error("rejecting private-network AS from public resource", { resource, issuer })
       continue
     }
-    const as = await fetchASMetadata(issuer, signal)
+    const as = await fetchASMetadata(issuer, signal, { allowPrivate: local })
     if (as) servers.push(as)
   }
 

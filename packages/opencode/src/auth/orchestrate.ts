@@ -77,6 +77,14 @@ export async function handleAuth(
 
   const server = result.servers[0]!
 
+  // Confused deputy detection: warn when the AS origin differs from the
+  // resource origin. A malicious server can return resource metadata
+  // listing a legitimate auth provider, causing the user to authenticate
+  // and then send the resulting token to the malicious server.
+  const resourceOrigin = new URL(url).origin
+  const serverOrigin = new URL(server.issuer).origin
+  const crossOrigin = resourceOrigin !== serverOrigin
+
   // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials.
   //    Registration is NOT done here for auth code flow — it is deferred to
   //    authorizationCode() which registers after the callback server binds,
@@ -98,6 +106,10 @@ export async function handleAuth(
       action: "authenticate",
       server: server.issuer,
       scopes: (result.resource.scopes_supported?.join(", ") ?? "default") + " (server-reported, unverified)",
+      ...(crossOrigin && {
+        warning: `Cross-origin auth: ${new URL(url).host} directs authentication to ${new URL(server.issuer).host}. ` +
+          `The resulting token will be sent to ${new URL(url).host}.`,
+      }),
     },
   })
 
@@ -159,15 +171,22 @@ export async function handleAuth(
   }
 
   // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
+  // redirect: "error" prevents the Bearer token from being forwarded to a
+  // redirect target, potentially on a different origin. If the server
+  // returns a 3xx, the token must not leak to the redirect destination.
   const auth = WebFetchAuth.headers(cred)
-  const retry = await fetch(url, { signal, headers: { ...base, ...auth } })
+  const retry = await fetch(url, {
+    signal,
+    redirect: "error",
+    headers: { ...base, ...auth },
+  }).catch(() => undefined)
 
-  if (retry.ok) return retry
+  if (retry?.ok) return retry
 
   // Remove stale credentials on retry failure so the user isn't stuck
   // with a bad token on subsequent requests. Use the canonical resource
   // identifier (same key used by set()) — not the original request URL.
-  log.error("auth retry failed, removing stale credential", { url, status: retry.status })
+  log.error("auth retry failed, removing stale credential", { url, status: retry?.status })
   await WebFetchAuth.remove(result.resource.resource).catch(() => {})
   return undefined
 }

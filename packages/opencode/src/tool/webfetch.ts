@@ -15,6 +15,57 @@ const log = Log.create({ service: "webfetch" })
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
+const MAX_REDIRECTS = 10
+
+/**
+ * Follow redirects manually, stripping credentials when crossing origins.
+ * Prevents Authorization header leakage on cross-origin 3xx chains.
+ */
+async function safeFetch(
+  url: string,
+  options: { signal: AbortSignal; headers: Record<string, string> },
+  credentials: Record<string, string>,
+): Promise<Response> {
+  if (!Object.keys(credentials).length) {
+    return fetch(url, {
+      signal: options.signal,
+      headers: options.headers,
+    })
+  }
+
+  const origin = new URL(url).origin
+  let current = url
+
+  for (let i = 0; i <= MAX_REDIRECTS; i++) {
+    const response = await fetch(current, {
+      signal: options.signal,
+      headers: { ...options.headers, ...credentials },
+      redirect: "manual",
+    })
+
+    if (response.status < 300 || response.status >= 400) {
+      return response
+    }
+
+    const location = response.headers.get("location")
+    if (!location) return response
+
+    const target = new URL(location, current)
+    if (target.origin !== origin) {
+      log.info("cross-origin redirect, stripping credentials", {
+        from: new URL(current).origin,
+        to: target.origin,
+      })
+      return fetch(target.href, {
+        signal: options.signal,
+        headers: options.headers,
+      })
+    }
+    current = target.href
+  }
+
+  throw new Error(`Too many redirects (>${MAX_REDIRECTS})`)
+}
 
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
@@ -80,17 +131,11 @@ export const WebFetchTool = Tool.define(
               // Local file lookup only; OAuth discovery runs after a 401/403 challenge.
               const auth = await WebFetchAuth.resolve(params.url)
 
-              const initial = await fetch(params.url, {
-                signal,
-                headers: { ...headers, ...auth },
-              })
+              const initial = await safeFetch(params.url, { signal, headers }, auth)
 
               let response =
                 initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
-                  ? await fetch(params.url, {
-                      signal,
-                      headers: { ...headers, ...auth, "User-Agent": "opencode" },
-                    })
+                  ? await safeFetch(params.url, { signal, headers: { ...headers, "User-Agent": "opencode" } }, auth)
                   : initial
 
               // Clear the request timeout before entering the interactive OAuth flow.
@@ -303,34 +348,14 @@ async function handleAuth(
   }
 
   // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header).
-  //    Use redirect: "manual" to avoid leaking credentials across origins.
-  const retry = await fetch(url, {
-    signal,
-    headers: { ...base, ...WebFetchAuth.headers(cred) },
-    redirect: "manual",
-  })
+  //    safeFetch uses redirect: "manual" with per-hop origin checks to prevent
+  //    Bearer token leakage on cross-origin redirect chains.
+  const retry = await safeFetch(url, { signal, headers: base }, WebFetchAuth.headers(cred))
 
   if (retry.ok) return retry
 
-  if (retry.status >= 300 && retry.status < 400) {
-    const location = retry.headers.get("location")
-    if (location) {
-      const target = new URL(location, url)
-      const origin = new URL(url).origin
-      if (target.origin === origin) {
-        return fetch(target.href, {
-          signal,
-          headers: { ...base, ...WebFetchAuth.headers(cred) },
-        })
-      }
-      log.info("cross-origin redirect, stripping credentials", {
-        from: origin,
-        to: target.origin,
-      })
-      return fetch(target.href, { signal, headers: base })
-    }
-  }
-
+  // Remove stale credentials on retry failure so the user isn't stuck
+  // with a bad token on subsequent requests.
   log.error("auth retry failed, removing stale credential", { url, status: retry.status })
   await WebFetchAuth.remove(url).catch(() => {})
   return undefined

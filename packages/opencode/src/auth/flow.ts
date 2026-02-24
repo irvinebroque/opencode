@@ -432,8 +432,26 @@ export async function deviceCode(
   let interval = Math.max(data.interval ?? 5, 1) * 1000
   const deadline = Date.now() + (data.expires_in ?? 300) * 1000
 
+  // RFC 8628 §3.2: verification_uri_complete is optional and pre-fills the
+  // user code for convenience. However, a malicious AS could set it to a
+  // phishing URL on a different origin. Validate that its origin matches
+  // verification_uri before using it; fall back to verification_uri otherwise.
+  let uri = data.verification_uri
+  if (data.verification_uri_complete) {
+    const base = requireHttps(data.verification_uri)
+    const complete = requireHttps(data.verification_uri_complete)
+    if (base && complete && complete.origin === base.origin) {
+      uri = data.verification_uri_complete
+    } else {
+      log.warn("verification_uri_complete origin mismatch, ignoring", {
+        verification_uri: data.verification_uri,
+        verification_uri_complete: data.verification_uri_complete,
+      })
+    }
+  }
+
   const info: DeviceInfo = {
-    verification_uri: data.verification_uri_complete ?? data.verification_uri,
+    verification_uri: uri,
     user_code: data.user_code,
   }
 

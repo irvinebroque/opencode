@@ -595,6 +595,35 @@ describe("deviceCode() (RFC 8628)", () => {
     expect(result).toBeUndefined()
   })
 
+  test("rejects device authorization response missing expires_in (RFC 8628 §3.2)", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        // Response omits REQUIRED expires_in field
+        return new Response(
+          JSON.stringify({
+            device_code: "dc-no-expiry",
+            user_code: "NOEXP",
+            verification_uri: "https://as.example.com/verify",
+            interval: 5,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    // expires_in is REQUIRED per RFC 8628 §3.2 — must reject
+    expect(result).toBeUndefined()
+  })
+
   test("clamps absurdly large expires_in to MAX_DEVICE_CODE_LIFETIME", async () => {
     // A malicious AS returning expires_in: 999999999 (~31 years) must not
     // cause the poll loop to run indefinitely. The deadline should be clamped

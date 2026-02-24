@@ -164,7 +164,7 @@ describe("register() (RFC 7591)", () => {
 
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      registration_endpoint: `http://localhost:${s.port as number}/register`,
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
     const result = await register(meta, "http://127.0.0.1:19877/callback")
@@ -187,7 +187,7 @@ describe("register() (RFC 7591)", () => {
 
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      registration_endpoint: `http://localhost:${s.port as number}/register`,
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
     const result = await register(meta, "http://127.0.0.1:19877/callback")
@@ -210,7 +210,7 @@ describe("register() (RFC 7591)", () => {
 
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      registration_endpoint: `http://localhost:${s.port as number}/register`,
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
       response_types_supported: ["code"],
     }
     const result = await register(meta, "http://127.0.0.1:19877/callback")
@@ -220,7 +220,7 @@ describe("register() (RFC 7591)", () => {
   test("returns undefined on network error", async () => {
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      registration_endpoint: "http://localhost:1/register",
+      registration_endpoint: "http://127.0.0.1:1/register",
       response_types_supported: ["code"],
     }
     const result = await register(meta, "http://127.0.0.1:19877/callback")
@@ -291,8 +291,8 @@ describe("deviceCode() (RFC 8628)", () => {
 
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      device_authorization_endpoint: `http://localhost:${s.port as number}/device`,
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await deviceCode("https://api.example.com/data", resource, meta, client)
@@ -317,8 +317,8 @@ describe("deviceCode() (RFC 8628)", () => {
 
     const meta: ASMetadata = {
       issuer: "https://as.example.com",
-      device_authorization_endpoint: `http://localhost:${s.port as number}/device`,
-      token_endpoint: `http://localhost:${s.port as number}/token`,
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
       response_types_supported: ["code"],
     }
     const result = await deviceCode("https://api.example.com/data", resource, meta, client)

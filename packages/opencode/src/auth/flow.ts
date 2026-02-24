@@ -22,7 +22,7 @@
  */
 
 import { Log } from "../util/log"
-import type { ASMetadata, ResourceMetadata } from "./discovery"
+import { requireHttps, isLoopback, type ASMetadata, type ResourceMetadata } from "./discovery"
 import * as WebFetchAuth from "./webfetch-auth"
 
 const log = Log.create({ service: "webfetch.flow" })
@@ -92,6 +92,12 @@ export async function register(
   redirectUri: string,
 ): Promise<ClientInfo | undefined> {
   if (!metadata.registration_endpoint) return undefined
+
+  // Validate registration endpoint is HTTPS (or HTTP loopback)
+  if (!requireHttps(metadata.registration_endpoint)) {
+    log.error("registration_endpoint must be HTTPS", { url: metadata.registration_endpoint })
+    return undefined
+  }
 
   log.info("attempting dynamic client registration", { endpoint: metadata.registration_endpoint })
 
@@ -222,7 +228,7 @@ export async function authorizationCode(
   resource: string,
   resourceMeta: ResourceMetadata,
   asMeta: ASMetadata,
-  client: ClientInfo,
+  client: ClientInfo | undefined,
   scopes?: string[],
 ): Promise<WebFetchAuth.Credential | undefined> {
   if (!asMeta.authorization_endpoint || !asMeta.token_endpoint) {
@@ -230,16 +236,41 @@ export async function authorizationCode(
     return undefined
   }
 
+  // Defense-in-depth: validate endpoint schemes even though fetchASMetadata
+  // already checks. Protects against callers that construct ASMetadata manually.
+  if (!requireHttps(asMeta.authorization_endpoint)) {
+    log.error("authorization_endpoint must be HTTPS", { url: asMeta.authorization_endpoint })
+    return undefined
+  }
+  if (!requireHttps(asMeta.token_endpoint)) {
+    log.error("token_endpoint must be HTTPS", { url: asMeta.token_endpoint })
+    return undefined
+  }
+
   const codes = await pkce()
   const st = state()
   const scope = scopes?.join(" ") ?? resourceMeta.scopes_supported?.join(" ") ?? ""
 
-  // Start callback server FIRST to get the actual port
-  const result = await callbackServer(st, (port) => {
+  // Capture a mutable client reference — registration is deferred until the
+  // callback server binds to a port so the redirect_uri matches (#6).
+  let resolved = client
+
+  // Start callback server FIRST to get the actual port, then register/build URL
+  const result = await callbackServer(st, async (port) => {
+    // Deferred registration: register with the actual port the server bound to
+    if (!resolved && asMeta.registration_endpoint) {
+      const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
+      resolved = (await register(asMeta, redirectUri)) ?? undefined
+    }
+    if (!resolved) {
+      log.error("no client available for authorization code flow")
+      return undefined
+    }
+
     const redirectUri = `http://127.0.0.1:${port}${CALLBACK_PATH}`
     const params = new URLSearchParams({
       response_type: "code",
-      client_id: client.client_id,
+      client_id: resolved.client_id,
       redirect_uri: redirectUri,
       state: st,
       code_challenge: codes.challenge,
@@ -250,7 +281,7 @@ export async function authorizationCode(
     params.set("resource", resourceMeta.resource)
     return `${asMeta.authorization_endpoint}?${params.toString()}`
   })
-  if (!result) return undefined
+  if (!result || !resolved) return undefined
 
   const redirectUri = `http://127.0.0.1:${result.port}${CALLBACK_PATH}`
 
@@ -259,10 +290,10 @@ export async function authorizationCode(
     grant_type: "authorization_code",
     code: result.code,
     redirect_uri: redirectUri,
-    client_id: client.client_id,
+    client_id: resolved.client_id,
     code_verifier: codes.verifier,
   })
-  if (client.client_secret) body.set("client_secret", client.client_secret)
+  if (resolved.client_secret) body.set("client_secret", resolved.client_secret)
 
   const response = await fetch(asMeta.token_endpoint, {
     method: "POST",
@@ -294,8 +325,8 @@ export async function authorizationCode(
     refresh_token: tokens.refresh_token,
     expires_at: tokens.expires_in ? Date.now() / 1000 + tokens.expires_in : undefined,
     scope: tokens.scope ?? scope,
-    oauth_client_id: client.client_id,
-    oauth_client_secret: client.client_secret,
+    oauth_client_id: resolved.client_id,
+    oauth_client_secret: resolved.client_secret,
     issuer: asMeta.issuer,
   }
 
@@ -336,6 +367,16 @@ export async function deviceCode(
     return undefined
   }
 
+  // Defense-in-depth: validate endpoint schemes
+  if (!requireHttps(asMeta.device_authorization_endpoint)) {
+    log.error("device_authorization_endpoint must be HTTPS", { url: asMeta.device_authorization_endpoint })
+    return undefined
+  }
+  if (!requireHttps(asMeta.token_endpoint)) {
+    log.error("token_endpoint must be HTTPS", { url: asMeta.token_endpoint })
+    return undefined
+  }
+
   const scope = scopes?.join(" ") ?? resourceMeta.scopes_supported?.join(" ") ?? ""
   const body = new URLSearchParams({ client_id: client.client_id })
   if (scope) body.set("scope", scope)
@@ -364,8 +405,9 @@ export async function deviceCode(
 
   if (!data || !data.device_code || !data.user_code || !data.verification_uri) return undefined
 
-  // RFC 8628 §3.2: default polling interval is 5 seconds
-  let interval = (data.interval ?? 5) * 1000
+  // RFC 8628 §3.2: default polling interval is 5 seconds.
+  // Clamp minimum to 1s to prevent tight-loop polling from a malicious AS.
+  let interval = Math.max(data.interval ?? 5, 1) * 1000
   const deadline = Date.now() + (data.expires_in ?? 300) * 1000
 
   const info: DeviceInfo = {
@@ -416,10 +458,11 @@ export async function deviceCode(
       }
       if (json.error === "authorization_pending") continue
 
-      // RFC 8628 §3.5: any other error is a terminal failure
+      // RFC 8628 §3.5: any other error is a terminal failure.
+      // Truncate untrusted AS error descriptions to prevent log injection.
       log.error("device code poll failed", {
-        error: json.error,
-        description: json.error_description,
+        error: String(json.error ?? "").slice(0, 200),
+        description: String(json.error_description ?? "").slice(0, 500),
         status: response.status,
       })
       return undefined
@@ -436,8 +479,6 @@ export async function deviceCode(
 // Local callback server for authorization code flow
 // ---------------------------------------------------------------------------
 
-let server: ReturnType<typeof Bun.serve> | undefined
-
 type CallbackResult = { code: string; port: number }
 
 /**
@@ -448,102 +489,128 @@ type CallbackResult = { code: string; port: number }
  * on, ensuring the redirect_uri always matches. This prevents the port mismatch
  * bug where the URL encodes port 19877 but the server is on 19878+.
  *
+ * The callback is async to support deferred client registration — registration
+ * must happen after the port is known so the redirect_uri matches.
+ *
  * @param expected - Expected state parameter for CSRF validation
- * @param buildAuthUrl - Callback that receives actual port, returns the authorization URL
+ * @param buildAuthUrl - Async callback that receives actual port, returns the authorization URL
  */
 async function callbackServer(
   expected: string,
-  buildAuthUrl: (port: number) => string,
+  buildAuthUrl: (port: number) => Promise<string | undefined>,
 ): Promise<CallbackResult | undefined> {
-  return new Promise((resolve) => {
-    let timeout: ReturnType<typeof setTimeout>
-    let port = CALLBACK_PORT
+  // Server reference is scoped to this closure — not module-level — to prevent
+  // concurrent OAuth flows from clobbering each other's server reference.
+  let srv: ReturnType<typeof Bun.serve> | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let port = CALLBACK_PORT
 
-    function cleanup() {
-      clearTimeout(timeout)
-      if (server) {
-        server.stop()
-        server = undefined
-      }
+  let resolve: (value: CallbackResult | undefined) => void
+  const promise = new Promise<CallbackResult | undefined>((r) => {
+    resolve = r
+  })
+
+  function cleanup() {
+    if (timer) clearTimeout(timer)
+    if (srv) {
+      srv.stop()
+      srv = undefined
     }
+  }
 
-    // Try to start server, handling port conflicts
-    for (let i = 0; i < 10; i++) {
-      try {
-        server = Bun.serve({
-          port,
-          fetch(req) {
-            const url = new URL(req.url)
-            if (url.pathname !== CALLBACK_PATH) {
-              return new Response("Not found", { status: 404 })
-            }
+  // Try to start server, handling port conflicts.
+  // Binds to 127.0.0.1 only — not 0.0.0.0 — to prevent LAN exposure.
+  for (let i = 0; i < 10; i++) {
+    try {
+      srv = Bun.serve({
+        port,
+        hostname: "127.0.0.1",
+        fetch(req) {
+          const url = new URL(req.url)
+          if (url.pathname !== CALLBACK_PATH) {
+            return new Response("Not found", { status: 404 })
+          }
 
-            const code = url.searchParams.get("code")
-            const st = url.searchParams.get("state")
-            const error = url.searchParams.get("error")
-            const desc = url.searchParams.get("error_description")
+          const code = url.searchParams.get("code")
+          const st = url.searchParams.get("state")
+          const error = url.searchParams.get("error")
+          const desc = url.searchParams.get("error_description")
 
-            // CSRF check — state must match
-            if (!st || st !== expected) {
-              return new Response(htmlError("Invalid state parameter"), {
-                status: 400,
-                headers: { "Content-Type": "text/html" },
-              })
-            }
-
-            if (error) {
-              cleanup()
-              resolve(undefined)
-              return new Response(htmlError(desc ?? error), {
-                headers: { "Content-Type": "text/html" },
-              })
-            }
-
-            if (!code) {
-              cleanup()
-              resolve(undefined)
-              return new Response(htmlError("No authorization code"), {
-                status: 400,
-                headers: { "Content-Type": "text/html" },
-              })
-            }
-
-            cleanup()
-            resolve({ code, port })
-            return new Response(HTML_SUCCESS, {
+          // CSRF check — state must match
+          if (!st || st !== expected) {
+            return new Response(htmlError("Invalid state parameter"), {
+              status: 400,
               headers: { "Content-Type": "text/html" },
             })
-          },
-        })
-        break
-      } catch {
-        port++
-        if (i === 9) {
-          log.error("could not find open port for callback server")
-          resolve(undefined)
-          return
-        }
+          }
+
+          if (error) {
+            cleanup()
+            resolve(undefined)
+            return new Response(htmlError(desc ?? error), {
+              headers: { "Content-Type": "text/html" },
+            })
+          }
+
+          if (!code) {
+            cleanup()
+            resolve(undefined)
+            return new Response(htmlError("No authorization code"), {
+              status: 400,
+              headers: { "Content-Type": "text/html" },
+            })
+          }
+
+          cleanup()
+          resolve({ code, port })
+          return new Response(HTML_SUCCESS, {
+            headers: { "Content-Type": "text/html" },
+          })
+        },
+      })
+      break
+    } catch {
+      port++
+      if (i === 9) {
+        log.error("could not find open port for callback server")
+        return undefined
       }
     }
+  }
 
-    // Build auth URL with the actual port the server is on
-    const authUrl = buildAuthUrl(port)
+  // Build auth URL with the actual port (async — may perform deferred registration)
+  const authUrl = await buildAuthUrl(port)
+  if (!authUrl) {
+    cleanup()
+    return undefined
+  }
 
-    // Open browser
-    const open =
-      process.platform === "darwin"
-        ? "open"
-        : process.platform === "win32"
-          ? "start"
-          : "xdg-open"
-    Bun.spawn([open, authUrl], { stdout: "ignore", stderr: "ignore" })
+  // Validate authorization URL scheme before opening in browser.
+  // A malicious authorization_endpoint (e.g. file:///..., custom-scheme://...)
+  // could trigger unintended behavior via the OS URL handler.
+  const authOrigin = new URL(authUrl).hostname
+  if (!authUrl.startsWith("https://") && !(authUrl.startsWith("http://") && isLoopback(authOrigin))) {
+    log.error("authorization URL must use HTTPS", { url: authUrl })
+    cleanup()
+    return undefined
+  }
 
-    log.info("opened browser for authorization", { url: authUrl, port })
+  // Open browser
+  const open =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+        ? "start"
+        : "xdg-open"
+  Bun.spawn([open, authUrl], { stdout: "ignore", stderr: "ignore" })
 
-    timeout = setTimeout(() => {
-      log.error("authorization callback timed out")
-      cleanup()
-      resolve(undefined)
-    }, CALLBACK_TIMEOUT)
-  })
+  log.info("opened browser for authorization", { url: authUrl, port })
+
+  timer = setTimeout(() => {
+    log.error("authorization callback timed out")
+    cleanup()
+    resolve(undefined)
+  }, CALLBACK_TIMEOUT)
+
+  return promise
 }

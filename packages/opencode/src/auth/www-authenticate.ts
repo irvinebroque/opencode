@@ -186,7 +186,12 @@ export function parse(header: string): Challenge[] {
       pos = skipOWS(header, pos)
 
       const val = parseTokenOrQuoted(header, pos)
-      if (!val) break
+      if (!val) {
+        // If we failed on a quoted-string the remaining input is corrupted —
+        // skip to end to prevent phantom challenges from the unmatched content.
+        if (pos < header.length && header[pos] === '"') pos = header.length
+        break
+      }
 
       // RFC 9110 §11.2: param names MUST be unique per challenge (case-insensitive)
       const normalized = name.value.toLowerCase()
@@ -251,9 +256,10 @@ export function all(response: Response): Challenge[] {
  * @returns The resource_metadata URL if found in a Bearer challenge, undefined otherwise
  */
 export function resourceMetadataUrl(challenges: Challenge[]): string | undefined {
+  // RFC 9728 §5.1: resource_metadata MAY appear in any auth scheme (not just Bearer).
+  // DPoP and future schemes can also carry this parameter.
   for (const c of challenges) {
-    if (c.scheme.toLowerCase() === "bearer" && c.params["resource_metadata"])
-      return c.params["resource_metadata"]
+    if (c.params["resource_metadata"]) return c.params["resource_metadata"]
   }
   return undefined
 }

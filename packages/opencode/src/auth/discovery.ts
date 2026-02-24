@@ -71,7 +71,7 @@ export type ASMetadata = {
  * per RFC 8252 §7.3 which allows HTTP for the loopback interface redirect.
  * This also enables testing with local mock servers.
  */
-function requireHttps(raw: string): URL | undefined {
+export function requireHttps(raw: string): URL | undefined {
   if (!URL.canParse(raw)) return undefined
   const url = new URL(raw)
   if (url.protocol === "https:") return url
@@ -79,9 +79,11 @@ function requireHttps(raw: string): URL | undefined {
   return undefined
 }
 
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]", "::1"])
+// Only IP literals — "localhost" is excluded because it is DNS-resolvable
+// and could map to a non-loopback address via /etc/hosts or DNS poisoning.
+const LOOPBACK = new Set(["127.0.0.1", "[::1]", "::1"])
 
-function isLoopback(hostname: string): boolean {
+export function isLoopback(hostname: string): boolean {
   return LOOPBACK.has(hostname)
 }
 
@@ -262,6 +264,7 @@ function oidcMetadataUrl(issuer: string): string {
 export async function fetchResourceMetadata(
   url: string,
   resource: string,
+  signal?: AbortSignal,
 ): Promise<ResourceMetadata | undefined> {
   // RFC 9728 §7.7: metadata URL must be HTTPS
   if (!requireHttps(url)) {
@@ -275,6 +278,7 @@ export async function fetchResourceMetadata(
   const response = await fetch(url, {
     headers: { Accept: "application/json" },
     redirect: "error",
+    signal,
   }).catch(() => undefined)
 
   if (!response || !response.ok) {
@@ -347,7 +351,7 @@ export async function fetchResourceMetadata(
  * Falls back to OIDC Discovery (.well-known/openid-configuration) if
  * the RFC 8414 endpoint is not available.
  */
-export async function fetchASMetadata(issuer: string): Promise<ASMetadata | undefined> {
+export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Promise<ASMetadata | undefined> {
   // RFC 8414 §2: issuer must be HTTPS, no query/fragment
   if (!validateIssuer(issuer)) {
     log.error("invalid issuer identifier", { issuer })
@@ -360,6 +364,7 @@ export async function fetchASMetadata(issuer: string): Promise<ASMetadata | unde
   let response = await fetch(url, {
     headers: { Accept: "application/json" },
     redirect: "error",
+    signal,
   }).catch(() => undefined)
 
   // Fallback to OIDC discovery
@@ -369,6 +374,7 @@ export async function fetchASMetadata(issuer: string): Promise<ASMetadata | unde
     response = await fetch(fallback, {
       headers: { Accept: "application/json" },
       redirect: "error",
+      signal,
     }).catch(() => undefined)
   }
 
@@ -417,6 +423,21 @@ export async function fetchASMetadata(issuer: string): Promise<ASMetadata | unde
     return undefined
   }
 
+  // Validate endpoint URLs are HTTPS (or HTTP loopback per RFC 8252 §7.3).
+  // A malicious AS metadata document could set these to HTTP URLs, exposing
+  // authorization codes, PKCE verifiers, or tokens in cleartext.
+  for (const field of [
+    "authorization_endpoint",
+    "token_endpoint",
+    "registration_endpoint",
+    "device_authorization_endpoint",
+  ] as const) {
+    if (metadata[field] && !requireHttps(metadata[field]!)) {
+      log.error(`AS metadata ${field} must be HTTPS`, { issuer, value: metadata[field] })
+      return undefined
+    }
+  }
+
   // RFC 8414 §2: default grant_types_supported
   if (!metadata.grant_types_supported) {
     metadata.grant_types_supported = ["authorization_code", "implicit"]
@@ -454,16 +475,40 @@ export async function fetchASMetadata(issuer: string): Promise<ASMetadata | unde
 export async function discover(
   resource: string,
   metadataUrl?: string,
+  signal?: AbortSignal,
 ): Promise<{ resource?: ResourceMetadata; servers: ASMetadata[] }> {
+  const resourceHost = new URL(resource).hostname
+  const fromLoopback = isLoopback(resourceHost)
+
+  // SSRF protection: reject loopback metadata URLs from non-loopback resources.
+  // A malicious server could return 401 with resource_metadata pointing at
+  // http://127.0.0.1:PORT/... to probe local services.
+  if (metadataUrl) {
+    const metaHost = new URL(metadataUrl).hostname
+    if (isLoopback(metaHost) && !fromLoopback) {
+      log.error("rejecting loopback metadata URL from non-loopback resource", {
+        resource,
+        metadataUrl,
+      })
+      return { servers: [] }
+    }
+  }
+
   const probe = metadataUrl ?? resourceMetadataUrl(resource)
-  const meta = await fetchResourceMetadata(probe, resource)
+  const meta = await fetchResourceMetadata(probe, resource, signal)
 
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
 
   const servers: ASMetadata[] = []
   for (const issuer of meta.authorization_servers) {
-    const as = await fetchASMetadata(issuer)
+    // SSRF protection: reject loopback AS from non-loopback resource
+    const issuerHost = new URL(issuer).hostname
+    if (isLoopback(issuerHost) && !fromLoopback) {
+      log.error("rejecting loopback AS from non-loopback resource", { resource, issuer })
+      continue
+    }
+    const as = await fetchASMetadata(issuer, signal)
     if (as) servers.push(as)
   }
 

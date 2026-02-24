@@ -126,7 +126,7 @@ describe("fetchResourceMetadata validation", () => {
     })
     servers.push(s)
     // Use http for tests (the HTTPS check is bypassed by passing an explicit URL)
-    return `http://localhost:${s.port}`
+    return `http://127.0.0.1:${s.port}`
   }
 
   test("rejects non-HTTPS metadata URL", async () => {
@@ -151,7 +151,7 @@ describe("fetchResourceMetadata validation", () => {
       },
     })
     servers.push(s)
-    const result = await fetchResourceMetadata(`http://localhost:${s.port}`, "https://example.com")
+    const result = await fetchResourceMetadata(`http://127.0.0.1:${s.port}`, "https://example.com")
     expect(result).toBeUndefined()
   })
 
@@ -225,22 +225,22 @@ describe("fetchResourceMetadata validation", () => {
         const url = new URL(req.url)
         if (url.pathname === "/target") {
           return new Response(
-            JSON.stringify({ resource: `http://localhost:${resPort}` }),
+            JSON.stringify({ resource: `http://127.0.0.1:${resPort}` }),
             { headers: { "Content-Type": "application/json" } },
           )
         }
         // Return a redirect
         return new Response(null, {
           status: 302,
-          headers: { Location: `http://localhost:${resPort}/target` },
+          headers: { Location: `http://127.0.0.1:${resPort}/target` },
         })
       },
     })
     resPort = s.port as number
     servers.push(s)
     const result = await fetchResourceMetadata(
-      `http://localhost:${resPort}`,
-      `http://localhost:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
     )
     // redirect: "error" causes fetch to reject → result is undefined
     expect(result).toBeUndefined()
@@ -295,7 +295,7 @@ describe("fetchASMetadata validation", () => {
       },
     })
     servers.push(s)
-    return `http://localhost:${s.port}`
+    return `http://127.0.0.1:${s.port}`
   }
 
   test("rejects non-HTTPS issuer", async () => {
@@ -326,9 +326,9 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
-            token_endpoint: `http://localhost:${port}/token`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
             response_types_supported: ["code"],
           }),
           { headers: { "Content-Type": "application/json; charset=utf-8" } },
@@ -337,9 +337,9 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
-    expect(result!.issuer).toBe(`http://localhost:${port}`)
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
   })
 
   test("rejects text/plain content-type for AS metadata", async () => {
@@ -361,9 +361,9 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
-            token_endpoint: `http://localhost:${port}/token`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
             response_types_supported: [],
           }),
           { headers: { "Content-Type": "application/json" } },
@@ -372,16 +372,16 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeUndefined()
   })
 
   test("rejects metadata where issuer does not match (RFC 8414 §3.3)", async () => {
     const issuer = serveAS({
-      issuer: "http://localhost:99999",
+      issuer: "http://127.0.0.1:99999",
       response_types_supported: ["code"],
-      authorization_endpoint: "http://localhost:99999/authorize",
-      token_endpoint: "http://localhost:99999/token",
+      authorization_endpoint: "http://127.0.0.1:99999/authorize",
+      token_endpoint: "http://127.0.0.1:99999/token",
     })
     const result = await fetchASMetadata(issuer)
     expect(result).toBeUndefined()
@@ -395,9 +395,9 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
-            token_endpoint: `http://localhost:${port}/token`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
           }),
           { headers: { "Content-Type": "application/json" } },
         )
@@ -405,7 +405,7 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeUndefined()
   })
 
@@ -416,10 +416,10 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
+            issuer: `http://127.0.0.1:${port}`,
             response_types_supported: ["code"],
             grant_types_supported: ["authorization_code"],
-            token_endpoint: `http://localhost:${port}/token`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
           }),
           { headers: { "Content-Type": "application/json" } },
         )
@@ -427,7 +427,7 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeUndefined()
   })
 
@@ -438,10 +438,10 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
+            issuer: `http://127.0.0.1:${port}`,
             response_types_supported: ["code"],
             grant_types_supported: ["authorization_code"],
-            authorization_endpoint: `http://localhost:${port}/authorize`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
           }),
           { headers: { "Content-Type": "application/json" } },
         )
@@ -449,7 +449,7 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeUndefined()
   })
 
@@ -460,14 +460,14 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
-            token_endpoint: `http://localhost:${port}/token`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
             response_types_supported: ["code"],
             grant_types_supported: ["authorization_code"],
             scopes_supported: ["read", "write"],
             code_challenge_methods_supported: ["S256"],
-            registration_endpoint: `http://localhost:${port}/register`,
+            registration_endpoint: `http://127.0.0.1:${port}/register`,
           }),
           { headers: { "Content-Type": "application/json" } },
         )
@@ -475,11 +475,11 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
-    expect(result!.issuer).toBe(`http://localhost:${port}`)
-    expect(result!.authorization_endpoint).toBe(`http://localhost:${port}/authorize`)
-    expect(result!.token_endpoint).toBe(`http://localhost:${port}/token`)
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+    expect(result!.authorization_endpoint).toBe(`http://127.0.0.1:${port}/authorize`)
+    expect(result!.token_endpoint).toBe(`http://127.0.0.1:${port}/token`)
     expect(result!.response_types_supported).toEqual(["code"])
     expect(result!.grant_types_supported).toEqual(["authorization_code"])
     expect(result!.scopes_supported).toEqual(["read", "write"])
@@ -492,9 +492,9 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
-            token_endpoint: `http://localhost:${port}/token`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
             response_types_supported: ["code"],
           }),
           { headers: { "Content-Type": "application/json" } },
@@ -503,7 +503,7 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
     // RFC 8414 §2: default is ["authorization_code", "implicit"]
     expect(result!.grant_types_supported).toEqual(["authorization_code", "implicit"])
@@ -516,8 +516,8 @@ describe("fetchASMetadata validation", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${port}`,
-            authorization_endpoint: `http://localhost:${port}/authorize`,
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
             response_types_supported: ["token"],
             grant_types_supported: ["implicit"],
           }),
@@ -527,7 +527,7 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
     expect(result!.grant_types_supported).toEqual(["implicit"])
   })
@@ -545,9 +545,9 @@ describe("fetchASMetadata validation", () => {
         if (url.pathname.includes("openid-configuration"))
           return new Response(
             JSON.stringify({
-              issuer: `http://localhost:${port}`,
-              authorization_endpoint: `http://localhost:${port}/authorize`,
-              token_endpoint: `http://localhost:${port}/token`,
+              issuer: `http://127.0.0.1:${port}`,
+              authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+              token_endpoint: `http://127.0.0.1:${port}/token`,
               response_types_supported: ["code"],
             }),
             { headers: { "Content-Type": "application/json" } },
@@ -557,9 +557,9 @@ describe("fetchASMetadata validation", () => {
     })
     port = s.port as number
     servers.push(s)
-    const result = await fetchASMetadata(`http://localhost:${port}`)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
-    expect(result!.issuer).toBe(`http://localhost:${port}`)
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
   })
 })
 
@@ -582,9 +582,9 @@ describe("discover() integration", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            issuer: `http://localhost:${asPort}`,
-            authorization_endpoint: `http://localhost:${asPort}/authorize`,
-            token_endpoint: `http://localhost:${asPort}/token`,
+            issuer: `http://127.0.0.1:${asPort}`,
+            authorization_endpoint: `http://127.0.0.1:${asPort}/authorize`,
+            token_endpoint: `http://127.0.0.1:${asPort}/token`,
             response_types_supported: ["code"],
             grant_types_supported: ["authorization_code"],
           }),
@@ -604,8 +604,8 @@ describe("discover() integration", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            resource: `http://localhost:${resPort}`,
-            authorization_servers: [`http://localhost:${asPort}`],
+            resource: `http://127.0.0.1:${resPort}`,
+            authorization_servers: [`http://127.0.0.1:${asPort}`],
             scopes_supported: ["read"],
           }),
           { headers: { "Content-Type": "application/json" } },
@@ -619,15 +619,15 @@ describe("discover() integration", () => {
     // Both resource and metadataUrl point to the same origin so the
     // resource field comparison passes (RFC 9728 §3.3).
     const result = await discover(
-      `http://localhost:${resPort}`,
-      `http://localhost:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
     )
 
     expect(result.resource).toBeDefined()
-    expect(result.resource!.resource).toBe(`http://localhost:${resPort}`)
+    expect(result.resource!.resource).toBe(`http://127.0.0.1:${resPort}`)
     expect(result.servers).toHaveLength(1)
-    expect(result.servers[0]!.issuer).toBe(`http://localhost:${asPort}`)
-    expect(result.servers[0]!.authorization_endpoint).toBe(`http://localhost:${asPort}/authorize`)
+    expect(result.servers[0]!.issuer).toBe(`http://127.0.0.1:${asPort}`)
+    expect(result.servers[0]!.authorization_endpoint).toBe(`http://127.0.0.1:${asPort}/authorize`)
   })
 
   test("returns empty servers when resource has no authorization_servers", async () => {
@@ -637,7 +637,7 @@ describe("discover() integration", () => {
       fetch() {
         return new Response(
           JSON.stringify({
-            resource: `http://localhost:${resPort}`,
+            resource: `http://127.0.0.1:${resPort}`,
           }),
           { headers: { "Content-Type": "application/json" } },
         )
@@ -648,8 +648,8 @@ describe("discover() integration", () => {
 
     const { discover } = await import("../../src/auth/discovery")
     const result = await discover(
-      `http://localhost:${resPort}`,
-      `http://localhost:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
     )
 
     expect(result.resource).toBeDefined()

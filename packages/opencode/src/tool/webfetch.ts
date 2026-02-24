@@ -188,7 +188,7 @@ async function handleAuth(
   const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
 
   // 2. Discovery — RFC 9728 §4 (resource metadata) + RFC 8414 §3 (AS metadata)
-  const result = await Discovery.discover(url, metaUrl ?? undefined)
+  const result = await Discovery.discover(url, metaUrl ?? undefined, signal)
 
   if (!result.resource || !result.servers.length) {
     // Basic auth challenge without discovery — RFC 7617
@@ -207,26 +207,15 @@ async function handleAuth(
 
   const server = result.servers[0]!
 
-  // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials
+  // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials.
+  //    Registration is NOT done here for auth code flow — it is deferred to
+  //    authorizationCode() which registers after the callback server binds,
+  //    ensuring the redirect_uri port matches the actual listening port.
   let client: Flow.ClientInfo | undefined
 
   const existing = await WebFetchAuth.get(url).catch(() => undefined)
   if (existing?.oauth_client_id) {
     client = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
-  }
-
-  if (!client && server.registration_endpoint) {
-    const redirectUri = `http://127.0.0.1:19877/webfetch/oauth/callback`
-    client = (await Flow.register(server, redirectUri)) ?? undefined
-  }
-
-  if (!client) {
-    const docs = server.service_documentation ?? server.issuer
-    throw new Error(
-      `This URL requires OAuth authentication via ${server.issuer}, ` +
-        `but no client_id is configured and dynamic registration is not available. ` +
-        `Register a client at ${docs} and configure it in opencode.json.`,
-    )
   }
 
   await Effect.runPromise(
@@ -238,7 +227,7 @@ async function handleAuth(
         url,
         action: "authenticate",
         server: server.issuer,
-        scopes: result.resource.scopes_supported?.join(", ") ?? "default",
+        scopes: (result.resource.scopes_supported?.join(", ") ?? "default") + " (server-reported, unverified)",
       },
     }),
   )
@@ -263,27 +252,67 @@ async function handleAuth(
     supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
     server.device_authorization_endpoint
   ) {
-    const device = await Flow.deviceCode(url, result.resource, server, client, result.resource.scopes_supported)
-    if (device) {
-      log.info("device code flow", {
-        uri: device.info.verification_uri,
-        code: device.info.user_code,
-      })
-      cred = await device.poll()
+    // Register for device code if no client yet (device code doesn't use redirect_uri
+    // in the flow itself, so the hardcoded port is acceptable for registration metadata)
+    if (!client && server.registration_endpoint) {
+      client = (await Flow.register(server, "http://127.0.0.1:19877/webfetch/oauth/callback")) ?? undefined
+    }
+    if (client) {
+      const device = await Flow.deviceCode(url, result.resource, server, client, result.resource.scopes_supported)
+      if (device) {
+        log.info("device code flow", {
+          uri: device.info.verification_uri,
+          code: device.info.user_code,
+        })
+        cred = await device.poll()
+      }
     }
   }
 
   if (!cred) {
+    if (!client) {
+      const docs = server.service_documentation ?? server.issuer
+      throw new Error(
+        `This URL requires OAuth authentication via ${server.issuer}, ` +
+          `but no client_id is configured and dynamic registration is not available. ` +
+          `Register a client at ${docs} and configure it in opencode.json.`,
+      )
+    }
     throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
   }
 
-  // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
+  // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header).
+  //    Use redirect: "manual" to prevent Bearer token leakage to cross-origin
+  //    redirect targets. The Fetch spec says cross-origin redirects strip
+  //    Authorization, but runtime behavior varies.
   const retry = await fetch(url, {
     signal,
     headers: { ...base, ...WebFetchAuth.headers(cred) },
+    redirect: "manual",
   })
 
   if (retry.ok) return retry
+
+  // Handle redirects: only forward credentials to same-origin targets
+  if (retry.status >= 300 && retry.status < 400) {
+    const location = retry.headers.get("location")
+    if (location) {
+      const target = new URL(location, url)
+      const origin = new URL(url).origin
+      if (target.origin === origin) {
+        return fetch(target.href, {
+          signal,
+          headers: { ...base, ...WebFetchAuth.headers(cred) },
+        })
+      }
+      // Cross-origin redirect — follow without credentials
+      log.info("cross-origin redirect, stripping credentials", {
+        from: origin,
+        to: target.origin,
+      })
+      return fetch(target.href, { signal, headers: base })
+    }
+  }
 
   log.error("auth retry failed", { url, status: retry.status })
   return undefined

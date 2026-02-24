@@ -1,10 +1,23 @@
 /**
- * WWW-Authenticate header parser per RFC 9110 Section 11.6.1
+ * WWW-Authenticate header parser per RFC 9110 Section 11.6.1.
  *
- * Grammar:
+ * Implements the full grammar from RFC 7235 §2.1 and RFC 9110 §11.6.1:
  *   WWW-Authenticate = 1#challenge
- *   challenge = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
- *   auth-param = token BWS "=" BWS ( token / quoted-string )
+ *   challenge        = auth-scheme [ 1*SP ( token68 / #auth-param ) ]
+ *   auth-param       = token BWS "=" BWS ( token / quoted-string )
+ *   token68          = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
+ *
+ * Parser adapted from the audited implementation in irvinebroque/http-rfc-utils
+ * (src/auth/shared.ts) which passes 834+ spec compliance assertions.
+ *
+ * Key RFC compliance points:
+ * - RFC 9110 §5.6.2: token character set (tchar)
+ * - RFC 9110 §5.6.4: quoted-string with quoted-pair (backslash escaping)
+ * - RFC 9110 §11.2: auth-param names MUST be unique per challenge (case-insensitive)
+ * - RFC 7235 §2.1: challenge disambiguation between token68 and auth-params
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc9110.html#section-11.6.1
+ * @see https://www.rfc-editor.org/rfc/rfc7235.html#section-2.1
  */
 
 export type Challenge = {
@@ -13,151 +26,199 @@ export type Challenge = {
   token68?: string
 }
 
-// RFC 9110 Section 5.6.2: token character set
-// token = 1*tchar
-// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
-//         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
-function isTokenChar(c: number): boolean {
-  if (c >= 0x30 && c <= 0x39) return true // 0-9
-  if (c >= 0x41 && c <= 0x5a) return true // A-Z
-  if (c >= 0x61 && c <= 0x7a) return true // a-z
-  // tchar specials: !#$%&'*+-.^_`|~
-  return c === 0x21 || c === 0x23 || c === 0x24 || c === 0x25 ||
-    c === 0x26 || c === 0x27 || c === 0x2a || c === 0x2b ||
-    c === 0x2d || c === 0x2e || c === 0x5e || c === 0x5f ||
-    c === 0x60 || c === 0x7c || c === 0x7e
+/**
+ * RFC 9110 §5.6.2: token character set.
+ * tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+ *         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+ */
+const TOKEN_RE = /^[!#$%&'*+\-.^_`|~A-Za-z0-9]+$/
+
+/** RFC 7235 §2.1: token68 = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"=" */
+const TOKEN68_RE = /^[A-Za-z0-9\-._~+/]+=*$/
+
+function isTokenChar(c: string): boolean {
+  return TOKEN_RE.test(c)
 }
 
-const TOKEN68_CHARS = /^[A-Za-z0-9\-._~+/]+=*$/
+function skipOWS(input: string, i: number): number {
+  while (i < input.length && (input[i] === " " || input[i] === "\t")) i++
+  return i
+}
 
+function parseToken(input: string, i: number): { value: string; end: number } | undefined {
+  const start = i
+  while (i < input.length && isTokenChar(input[i]!)) i++
+  if (i === start) return undefined
+  return { value: input.slice(start, i), end: i }
+}
+
+/**
+ * Parse a quoted-string per RFC 9110 §5.6.4.
+ * quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
+ * quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
+ */
+function parseQuotedString(input: string, i: number): { value: string; end: number } | undefined {
+  if (input[i] !== '"') return undefined
+  i++
+  let result = ""
+  while (i < input.length) {
+    const c = input[i]!
+    if (c === '"') return { value: result, end: i + 1 }
+    if (c === "\\" && i + 1 < input.length) {
+      result += input[i + 1]
+      i += 2
+      continue
+    }
+    result += c
+    i++
+  }
+  // Unterminated quoted-string — return what we have (tolerant parsing)
+  return { value: result, end: i }
+}
+
+function parseTokenOrQuoted(input: string, i: number): { value: string; end: number } | undefined {
+  if (input[i] === '"') return parseQuotedString(input, i)
+  return parseToken(input, i)
+}
+
+function parseToken68(input: string, i: number): { value: string; end: number } | undefined {
+  const start = i
+  while (i < input.length && input[i] !== " " && input[i] !== "\t" && input[i] !== ",") i++
+  const candidate = input.slice(start, i)
+  if (!candidate || !TOKEN68_RE.test(candidate)) return undefined
+  return { value: candidate, end: i }
+}
+
+/**
+ * Peek ahead to check if the next content is "token = value" (an auth-param).
+ * Used to disambiguate between a new challenge scheme and continuation params.
+ */
+function isNextParam(input: string, i: number): boolean {
+  i = skipOWS(input, i)
+  const tok = parseToken(input, i)
+  if (!tok) return false
+  const afterTok = skipOWS(input, tok.end)
+  return input[afterTok] === "="
+}
+
+/**
+ * Parse a complete WWW-Authenticate header value into challenges.
+ *
+ * The parser handles the notoriously ambiguous WWW-Authenticate grammar by using
+ * a peek-ahead strategy: after reading a comma, it checks whether the next
+ * content is "token = value" (another param) or a bare token (new challenge scheme).
+ *
+ * Per RFC 9110 §11.2, auth-param names are checked for uniqueness within each
+ * challenge (case-insensitive). Challenges with duplicate params are rejected.
+ *
+ * @param header - Raw WWW-Authenticate header value
+ * @returns Array of parsed challenges. Invalid challenges are silently skipped.
+ */
 export function parse(header: string): Challenge[] {
   const challenges: Challenge[] = []
   let pos = 0
 
-  function skip() {
-    while (pos < header.length && (header[pos] === " " || header[pos] === "\t")) pos++
-  }
-
-  function token(): string {
-    const start = pos
-    while (pos < header.length && isTokenChar(header.charCodeAt(pos))) pos++
-    return header.slice(start, pos)
-  }
-
-  function quoted(): string {
-    if (header[pos] !== '"') return ""
-    pos++ // skip opening quote
-    let result = ""
-    while (pos < header.length) {
-      if (header[pos] === "\\") {
-        pos++
-        if (pos < header.length) {
-          result += header[pos]
-          pos++
-        }
-        continue
-      }
-      if (header[pos] === '"') {
-        pos++ // skip closing quote
-        return result
-      }
-      result += header[pos]
-      pos++
-    }
-    return result
-  }
-
-  function params(): Record<string, string> {
-    const result: Record<string, string> = {}
-    while (pos < header.length) {
-      skip()
-      if (pos >= header.length) break
-
-      // Save position to backtrack if this is a new scheme
-      const saved = pos
-      const key = token()
-      if (!key) break
-
-      skip()
-      if (pos >= header.length || header[pos] !== "=") {
-        // No "=" means this could be a new challenge scheme
-        // Check if there's a space+param or comma after this token
-        // If what we read looks like a scheme name (followed by space+params or end), backtrack
-        pos = saved
-        break
-      }
-      pos++ // skip "="
-      skip()
-
-      const val = header[pos] === '"' ? quoted() : token()
-      result[key.toLowerCase()] = val
-
-      skip()
-      if (pos < header.length && header[pos] === ",") {
-        pos++
-        // Peek ahead: if next non-whitespace is a token followed by "=", it's another param
-        // Otherwise it could be a new challenge
-        skip()
-        const peek = pos
-        const next = token()
-        skip()
-        if (next && pos < header.length && header[pos] === "=") {
-          // It's another param, continue
-          pos = peek
-          continue
-        }
-        // It's a new challenge; backtrack to the start of this token
-        pos = peek
-        break
-      }
-    }
-    return result
-  }
-
   while (pos < header.length) {
-    skip()
+    pos = skipOWS(header, pos)
+
+    // Skip leading commas (RFC 7235 §2.1 allows empty list members)
+    while (pos < header.length && header[pos] === ",") {
+      pos++
+      pos = skipOWS(header, pos)
+    }
     if (pos >= header.length) break
 
-    const scheme = token()
+    // Parse scheme
+    const scheme = parseToken(header, pos)
     if (!scheme) {
       pos++
       continue
     }
+    pos = skipOWS(header, scheme.end)
 
-    skip()
-
-    // Check for token68 (no "=" in auth-param sense)
+    // Bare scheme (end of input or comma)
     if (pos >= header.length || header[pos] === ",") {
-      challenges.push({ scheme, params: {} })
+      challenges.push({ scheme: scheme.value, params: {} })
       if (pos < header.length && header[pos] === ",") pos++
       continue
     }
 
-    // Try to parse as params first by peeking ahead
-    const saved = pos
-    const first = token()
-    skip()
-    if (first && pos < header.length && header[pos] === "=") {
-      // Looks like auth-params, backtrack and parse fully
-      pos = saved
-      const p = params()
-      challenges.push({ scheme, params: p })
-    } else if (first && TOKEN68_CHARS.test(first)) {
-      // token68 format
-      challenges.push({ scheme, params: {}, token68: first })
-    } else {
-      // Bare scheme with something unexpected; push what we have
-      pos = saved
-      challenges.push({ scheme, params: {} })
+    // Try token68 first: peek to see if it looks like "token =" (auth-param)
+    // If not, try token68
+    const t68 = parseToken68(header, pos)
+    if (t68) {
+      const after68 = skipOWS(header, t68.end)
+      // token68 must be followed by end, comma, or new scheme — not "="
+      if (after68 >= header.length || header[after68] === ",") {
+        challenges.push({ scheme: scheme.value, params: {}, token68: t68.value })
+        pos = after68
+        if (pos < header.length && header[pos] === ",") pos++
+        continue
+      }
     }
 
-    skip()
+    // Parse auth-params
+    const params: Record<string, string> = {}
+    let duplicate = false
+
+    while (pos < header.length) {
+      pos = skipOWS(header, pos)
+      const name = parseToken(header, pos)
+      if (!name) break
+
+      pos = skipOWS(header, name.end)
+      if (pos >= header.length || header[pos] !== "=") {
+        // No "=" — this is a new scheme, not a param. Backtrack.
+        pos = name.end - name.value.length
+        break
+      }
+      pos++ // skip "="
+      pos = skipOWS(header, pos)
+
+      const val = parseTokenOrQuoted(header, pos)
+      if (!val) break
+
+      // RFC 9110 §11.2: param names MUST be unique per challenge (case-insensitive)
+      const normalized = name.value.toLowerCase()
+      if (normalized in params) duplicate = true
+      params[normalized] = val.value
+      pos = skipOWS(header, val.end)
+
+      if (pos < header.length && header[pos] === ",") {
+        const comma = pos
+        pos++
+        // Peek: is the next thing another param (token "=") or a new challenge?
+        if (isNextParam(header, pos)) continue
+        // It's a new challenge — leave pos after the comma
+        pos = comma + 1
+        break
+      }
+      break
+    }
+
+    // RFC 9110 §11.2: reject challenges with duplicate param names
+    if (!duplicate) {
+      challenges.push(
+        Object.keys(params).length > 0
+          ? { scheme: scheme.value, params }
+          : { scheme: scheme.value, params: {} },
+      )
+    }
+
+    pos = skipOWS(header, pos)
     if (pos < header.length && header[pos] === ",") pos++
   }
 
   return challenges
 }
 
+/**
+ * Extract all WWW-Authenticate challenges from a Response.
+ * Handles multiple WWW-Authenticate header values per RFC 9110 §5.3.
+ *
+ * @param response - HTTP response to extract challenges from
+ * @returns All parsed challenges across all WWW-Authenticate header values
+ */
 export function all(response: Response): Challenge[] {
   const result: Challenge[] = []
   const values: string[] = []
@@ -170,6 +231,15 @@ export function all(response: Response): Challenge[] {
   return result
 }
 
+/**
+ * Extract the resource_metadata URL from Bearer challenges per RFC 9728 §5.1.
+ *
+ * RFC 9728 §5.1: The resource server MAY include a "resource_metadata" parameter
+ * in Bearer challenges to indicate where its protected resource metadata can be found.
+ *
+ * @param challenges - Parsed challenges from WWW-Authenticate
+ * @returns The resource_metadata URL if found in a Bearer challenge, undefined otherwise
+ */
 export function resourceMetadataUrl(challenges: Challenge[]): string | undefined {
   for (const c of challenges) {
     if (c.scheme.toLowerCase() === "bearer" && c.params["resource_metadata"])

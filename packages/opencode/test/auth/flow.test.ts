@@ -8,9 +8,10 @@
  * - State generation
  * - Dynamic client registration per RFC 7591
  * - Device code polling per RFC 8628 §3.5 (slow_down interval handling)
+ * - Device code expires_in clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { pkce, state, register, deviceCode } from "../../src/auth/flow"
+import { pkce, state, register, deviceCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
 import type { ASMetadata, ResourceMetadata } from "../../src/auth/discovery"
 
 // RFC 7636 §4.1: code_verifier character set

@@ -3,6 +3,13 @@ import { Tool } from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { abortAfterAny } from "../util/abort"
+import { Log } from "../util/log"
+import * as WwwAuthenticate from "../auth/www-authenticate"
+import * as WebFetchAuth from "../auth/webfetch-auth"
+import * as Discovery from "../auth/discovery"
+import * as Flow from "../auth/flow"
+
+const log = Log.create({ service: "webfetch" })
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -62,13 +69,50 @@ export const WebFetchTool = Tool.define("webfetch", {
       "Accept-Language": "en-US,en;q=0.9",
     }
 
-    const initial = await fetch(params.url, { signal, headers })
+    // Check for pre-existing credentials before first request
+    let stored = await WebFetchAuth.get(params.url).catch(() => undefined)
+    const extra: Record<string, string> = {}
+    if (stored) {
+      // Attempt refresh if expired
+      if (WebFetchAuth.expired(stored) && stored.refresh_token && stored.issuer) {
+        const as = await Discovery.fetchASMetadata(stored.issuer)
+        if (as) {
+          const refreshed = await WebFetchAuth.refresh(stored, as)
+          if (refreshed) stored = refreshed
+        }
+      }
+      if (!WebFetchAuth.expired(stored)) {
+        Object.assign(extra, WebFetchAuth.headers(stored))
+      }
+    }
+
+    // Check for CF Access service token env vars
+    const cfId = process.env.CF_ACCESS_CLIENT_ID
+    const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
+    if (cfId && cfSecret && !Object.keys(extra).length) {
+      extra["CF-Access-Client-Id"] = cfId
+      extra["CF-Access-Client-Secret"] = cfSecret
+    }
+
+    const initial = await fetch(params.url, {
+      signal,
+      headers: { ...headers, ...extra },
+    })
 
     // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
-    const response =
+    let response =
       initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
-        ? await fetch(params.url, { signal, headers: { ...headers, "User-Agent": "opencode" } })
+        ? await fetch(params.url, {
+            signal,
+            headers: { ...headers, ...extra, "User-Agent": "opencode" },
+          })
         : initial
+
+    // Auth handling: detect 401/403 and attempt authentication
+    if (!response.ok && (response.status === 401 || response.status === 403)) {
+      const authed = await handleAuth(response, params.url, headers, signal, ctx)
+      if (authed) response = authed
+    }
 
     clearTimeout()
 
@@ -203,4 +247,162 @@ function convertHTMLToMarkdown(html: string): string {
   })
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
+}
+
+// Detect CF Access login pages: redirect to *.cloudflareaccess.com or body markers
+function isCfAccess(response: Response): boolean {
+  const location = response.headers.get("location") ?? ""
+  if (location.includes("cloudflareaccess.com")) return true
+  // cf-mitigated without "challenge" (which is bot detection) could indicate Access
+  const mitigated = response.headers.get("cf-mitigated")
+  if (mitigated && mitigated !== "challenge") return true
+  return false
+}
+
+async function handleAuth(
+  response: Response,
+  url: string,
+  base: Record<string, string>,
+  signal: AbortSignal,
+  ctx: Tool.Context,
+): Promise<Response | undefined> {
+  log.info("auth required", { url, status: response.status })
+
+  // 1. Parse WWW-Authenticate challenges
+  const challenges = WwwAuthenticate.all(response)
+  const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
+
+  // 2. Check for CF Access service token env vars on 403
+  if (response.status === 403 || isCfAccess(response)) {
+    const cfId = process.env.CF_ACCESS_CLIENT_ID
+    const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
+    if (cfId && cfSecret) {
+      log.info("retrying with CF Access service token", { url })
+      const retry = await fetch(url, {
+        signal,
+        headers: {
+          ...base,
+          "CF-Access-Client-Id": cfId,
+          "CF-Access-Client-Secret": cfSecret,
+        },
+      })
+      if (retry.ok) {
+        // Store for future use
+        await WebFetchAuth.set(new URL(url).origin, {
+          resource: new URL(url).origin,
+          scheme: "service-token",
+          client_id: cfId,
+          client_secret: cfSecret,
+        })
+        return retry
+      }
+    }
+  }
+
+  // 3. RFC 9728 / RFC 8414 discovery
+  const discovery = await Discovery.discover(url, metaUrl ?? undefined)
+
+  if (!discovery.resource || !discovery.servers.length) {
+    // If only Basic auth is offered, we could prompt for credentials
+    const basic = challenges.find((c) => c.scheme.toLowerCase() === "basic")
+    if (basic) {
+      log.info("basic auth challenge detected", { realm: basic.params["realm"] })
+      // For now, return informative error rather than prompting
+      throw new Error(
+        `This URL requires Basic authentication (realm: ${basic.params["realm"] ?? "unknown"}). ` +
+          `Configure credentials via CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET env vars ` +
+          `or set up a service token for this origin.`,
+      )
+    }
+
+    log.info("no auth discovery available", { url, challenges: challenges.length })
+    return undefined
+  }
+
+  const server = discovery.servers[0]
+
+  // 4. Resolve client credentials
+  let client: { client_id: string; client_secret?: string } | undefined
+
+  // Try stored OAuth client from previous registration
+  const existing = await WebFetchAuth.get(url).catch(() => undefined)
+  if (existing?.oauth_client_id) {
+    client = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
+  }
+
+  // Try dynamic client registration
+  if (!client && server.registration_endpoint) {
+    const redirectUri = `http://127.0.0.1:19877/webfetch/oauth/callback`
+    client = await Flow.register(server, redirectUri) ?? undefined
+  }
+
+  if (!client) {
+    const docs = server.service_documentation ?? server.issuer
+    throw new Error(
+      `This URL requires OAuth authentication via ${server.issuer}, ` +
+        `but no client_id is configured and dynamic registration is not available. ` +
+        `Register a client at ${docs} and configure it in opencode.json.`,
+    )
+  }
+
+  // 5. Prompt user for consent
+  await ctx.ask({
+    permission: "webfetch",
+    patterns: [url],
+    always: [new URL(url).origin + "/*"],
+    metadata: {
+      url,
+      action: "authenticate",
+      server: server.issuer,
+      scopes: discovery.resource.scopes_supported?.join(", ") ?? "default",
+    },
+  })
+
+  // 6. Execute OAuth flow (prefer auth code + PKCE)
+  const supports = server.grant_types_supported ?? ["authorization_code"]
+
+  let cred: WebFetchAuth.Credential | undefined
+
+  if (supports.includes("authorization_code") && server.authorization_endpoint) {
+    cred = await Flow.authorizationCode(
+      url,
+      discovery.resource,
+      server,
+      client,
+      discovery.resource.scopes_supported,
+    )
+  }
+
+  // Fallback to device code flow
+  if (!cred && supports.includes("urn:ietf:params:oauth:grant-type:device_code") && server.device_authorization_endpoint) {
+    const device = await Flow.deviceCode(
+      url,
+      discovery.resource,
+      server,
+      client,
+      discovery.resource.scopes_supported,
+    )
+    if (device) {
+      log.info("device code flow", {
+        uri: device.info.verification_uri,
+        code: device.info.user_code,
+      })
+      cred = await device.poll()
+    }
+  }
+
+  if (!cred) {
+    throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
+  }
+
+  // 7. Retry with credentials
+  const retry = await fetch(url, {
+    signal,
+    headers: { ...base, ...WebFetchAuth.headers(cred) },
+  })
+
+  if (retry.ok) return retry
+
+  log.error("auth retry failed", { url, status: retry.status })
+  return undefined
 }

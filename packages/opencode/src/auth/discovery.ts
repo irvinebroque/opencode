@@ -143,15 +143,13 @@ function expandV6(raw: string): number[] | undefined {
 }
 
 /**
- * Check whether a hostname is a private, loopback, or link-local IP address.
+ * Check whether an IP literal is a private, loopback, or link-local address.
  *
- * Used for SSRF protection to block requests targeting internal networks.
- * Covers RFC 1918 (10/8, 172.16/12, 192.168/16), RFC 6598 (100.64/10),
- * loopback (127/8), link-local (169.254/16 — including cloud metadata at
- * 169.254.169.254), and IPv6 equivalents (::1, fc00::/7, fe80::/10,
- * IPv4-mapped addresses).
+ * This is the synchronous core that only inspects IP address literals.
+ * Callers that need hostname-safe SSRF checks should use {@link isPrivateNetwork}
+ * which also resolves DNS names and checks well-known private hostnames.
  */
-export function isPrivateNetwork(hostname: string): boolean {
+function isPrivateIP(hostname: string): boolean {
   const host = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname
 
   // IPv4
@@ -199,6 +197,48 @@ export function isPrivateNetwork(hostname: string): boolean {
       (groups[7] >> 8) & 0xff,
       groups[7] & 0xff,
     ])
+  }
+
+  return false
+}
+
+/**
+ * Check whether a hostname refers to a private, loopback, or link-local address.
+ *
+ * Used for SSRF protection to block requests targeting internal networks.
+ * Covers:
+ * - IP literals: RFC 1918, RFC 6598, loopback, link-local, IPv6 equivalents
+ * - Known private hostname patterns: localhost, .localhost, .local, .internal
+ * - DNS resolution: resolves hostnames and checks all resulting IPs
+ *
+ * DNS resolution guards against rebinding attacks where a public-looking
+ * hostname (e.g. evil.com) resolves to a private IP (e.g. 169.254.169.254).
+ */
+export async function isPrivateNetwork(hostname: string): Promise<boolean> {
+  // Fast path: IP literals
+  if (isPrivateIP(hostname)) return true
+
+  const lower = hostname.toLowerCase()
+
+  // Well-known private hostnames (RFC 6761, mDNS, cloud metadata conventions)
+  if (lower === "localhost" || lower.endsWith(".localhost")) return true
+  if (lower.endsWith(".local")) return true
+  if (lower.endsWith(".internal")) return true
+
+  // Not an IP literal and not a known-private hostname — resolve DNS and
+  // check whether any of the resulting addresses are private.
+  const { promises: dns } = await import("node:dns")
+  try {
+    const addrs = await dns.resolve4(hostname)
+    if (addrs.some((ip) => isPrivateIP(ip))) return true
+  } catch {
+    // ENODATA / ENOTFOUND — no A records, continue to AAAA check
+  }
+  try {
+    const addrs = await dns.resolve6(hostname)
+    if (addrs.some((ip) => isPrivateIP(ip))) return true
+  } catch {
+    // ENODATA / ENOTFOUND — no AAAA records
   }
 
   return false
@@ -661,7 +701,7 @@ export async function discover(
   signal?: AbortSignal,
 ): Promise<{ resource?: ResourceMetadata; servers: ASMetadata[] }> {
   const resourceHost = new URL(resource).hostname
-  const local = isPrivateNetwork(resourceHost)
+  const local = await isPrivateNetwork(resourceHost)
 
   // SSRF protection: reject private-network metadata URLs from public resources.
   // A malicious server could return 401 with resource_metadata pointing at
@@ -670,7 +710,7 @@ export async function discover(
   // itself is on a private network (e.g. local development).
   if (metadataUrl) {
     const metaHost = new URL(metadataUrl).hostname
-    if (isPrivateNetwork(metaHost) && !local) {
+    if ((await isPrivateNetwork(metaHost)) && !local) {
       log.error("rejecting private-network metadata URL from public resource", {
         resource,
         metadataUrl,
@@ -690,7 +730,7 @@ export async function discover(
   for (const issuer of capped) {
     // SSRF protection: reject private-network AS from public resource
     const issuerHost = new URL(issuer).hostname
-    if (isPrivateNetwork(issuerHost) && !local) {
+    if ((await isPrivateNetwork(issuerHost)) && !local) {
       log.error("rejecting private-network AS from public resource", { resource, issuer })
       continue
     }

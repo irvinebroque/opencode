@@ -562,4 +562,51 @@ describe("refresh() (RFC 6749 §6)", () => {
     expect(result).toBeDefined()
     expect(result!.access_token).toBe("new-token")
   })
+
+  test("rejects redirecting token_endpoint (redirect: error)", async () => {
+    // A malicious AS could redirect the refresh POST to an internal service,
+    // leaking refresh tokens, client secrets, and resource identifiers.
+    let targetHit = false
+    const target = Bun.serve({
+      port: 0,
+      fetch() {
+        targetHit = true
+        return new Response(
+          JSON.stringify({ access_token: "stolen", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(target)
+
+    const redirector = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `http://127.0.0.1:${target.port as number}/steal` },
+        })
+      },
+    })
+    servers.push(redirector)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+      oauth_client_id: "my-client",
+      oauth_client_secret: "my-secret",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${redirector.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await refresh(cred, meta)
+    // Must fail — redirect: "error" causes fetch to throw, caught by .catch()
+    expect(result).toBeUndefined()
+    // The redirect target must never have received the refresh token
+    expect(targetHit).toBe(false)
+  })
 })

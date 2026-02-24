@@ -13,6 +13,12 @@
  * - RFC 7591 §2: client registration request format
  * - RFC 6749 §5.2: error response format for token endpoint
  *
+ * Security: All operational endpoint fetches (token exchange, registration,
+ * device authorization, token polling) use redirect: "error" to prevent a
+ * malicious AS from redirecting POST bodies containing sensitive credentials
+ * (auth codes, PKCE verifiers, client secrets, device codes) to internal
+ * services or attacker-controlled endpoints.
+ *
  * @see https://www.rfc-editor.org/rfc/rfc7636.html
  * @see https://www.rfc-editor.org/rfc/rfc8628.html
  * @see https://www.rfc-editor.org/rfc/rfc7591.html
@@ -330,9 +336,13 @@ export async function authorizationCode(
   body.set("resource", resourceMeta.resource)
   if (resolved.client_secret) body.set("client_secret", resolved.client_secret)
 
+  // redirect: "error" prevents a malicious AS from redirecting the token
+  // exchange POST to an internal service, leaking auth codes, PKCE verifiers,
+  // and client secrets to the redirect target.
   const response = await fetch(asMeta.token_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    redirect: "error",
     body: body.toString(),
   }).catch(() => undefined)
 
@@ -419,9 +429,13 @@ export async function deviceCode(
   // RFC 8707: audience-restricted tokens
   body.set("resource", resourceMeta.resource)
 
+  // redirect: "error" prevents a malicious AS from redirecting the device
+  // authorization POST to an internal service, leaking the client_id and
+  // resource parameters to the redirect target.
   const response = await fetch(asMeta.device_authorization_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    redirect: "error",
     body: body.toString(),
   }).catch(() => undefined)
 
@@ -500,9 +514,13 @@ export async function deviceCode(
         client_id: client.client_id,
       })
 
+      // redirect: "error" prevents a malicious AS from redirecting the device
+      // code token poll to an internal service, leaking device_code and
+      // client_id to the redirect target.
       const response = await fetch(asMeta.token_endpoint!, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        redirect: "error",
         body: body.toString(),
       }).catch(() => undefined)
 

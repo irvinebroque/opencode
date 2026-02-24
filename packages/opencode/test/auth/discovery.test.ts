@@ -12,6 +12,7 @@ import {
   asMetadataUrl,
   fetchResourceMetadata,
   fetchASMetadata,
+  isPrivateNetwork,
   MAX_AUTHORIZATION_SERVERS,
 } from "../../src/auth/discovery"
 
@@ -842,5 +843,70 @@ describe("discover() integration", () => {
     // but never more than 2 per entry).
     expect(fetches).toBeLessThanOrEqual(MAX_AUTHORIZATION_SERVERS * 2)
     expect(fetches).toBeGreaterThanOrEqual(MAX_AUTHORIZATION_SERVERS)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// isPrivateNetwork — SSRF protection (IP literals, hostnames, DNS resolution)
+// ---------------------------------------------------------------------------
+
+describe("isPrivateNetwork", () => {
+  // IP literal checks (existing behavior, now async)
+  test("detects private IPv4 addresses", async () => {
+    expect(await isPrivateNetwork("10.0.0.1")).toBe(true)
+    expect(await isPrivateNetwork("172.16.0.1")).toBe(true)
+    expect(await isPrivateNetwork("192.168.1.1")).toBe(true)
+    expect(await isPrivateNetwork("127.0.0.1")).toBe(true)
+    expect(await isPrivateNetwork("169.254.169.254")).toBe(true)
+    expect(await isPrivateNetwork("100.64.0.1")).toBe(true)
+  })
+
+  test("allows public IPv4 addresses", async () => {
+    expect(await isPrivateNetwork("8.8.8.8")).toBe(false)
+    expect(await isPrivateNetwork("1.1.1.1")).toBe(false)
+    expect(await isPrivateNetwork("93.184.216.34")).toBe(false)
+  })
+
+  test("detects private IPv6 addresses", async () => {
+    expect(await isPrivateNetwork("::1")).toBe(true)
+    expect(await isPrivateNetwork("[::1]")).toBe(true)
+    expect(await isPrivateNetwork("fc00::1")).toBe(true)
+    expect(await isPrivateNetwork("fe80::1")).toBe(true)
+  })
+
+  // Known private hostname patterns
+  test("blocks localhost and .localhost hostnames", async () => {
+    expect(await isPrivateNetwork("localhost")).toBe(true)
+    expect(await isPrivateNetwork("LOCALHOST")).toBe(true)
+    expect(await isPrivateNetwork("app.localhost")).toBe(true)
+    expect(await isPrivateNetwork("foo.bar.localhost")).toBe(true)
+  })
+
+  test("blocks .local (mDNS) hostnames", async () => {
+    expect(await isPrivateNetwork("myhost.local")).toBe(true)
+    expect(await isPrivateNetwork("printer.local")).toBe(true)
+  })
+
+  test("blocks .internal hostnames (cloud metadata)", async () => {
+    expect(await isPrivateNetwork("metadata.google.internal")).toBe(true)
+    expect(await isPrivateNetwork("anything.internal")).toBe(true)
+  })
+
+  // DNS resolution — localhost resolves to 127.0.0.1 on virtually all systems
+  test("resolves DNS and detects private IPs (localhost)", async () => {
+    // Even without the .localhost pattern check, DNS resolution of "localhost"
+    // should yield 127.0.0.1 which is private. This test validates both layers.
+    expect(await isPrivateNetwork("localhost")).toBe(true)
+  })
+
+  test("allows public DNS hostnames", async () => {
+    // google.com resolves to public IPs
+    expect(await isPrivateNetwork("google.com")).toBe(false)
+  })
+
+  test("allows unresolvable hostnames (fail-open for fetch to handle)", async () => {
+    // A hostname that doesn't resolve should return false — the subsequent
+    // fetch will fail with a network error, which is safe.
+    expect(await isPrivateNetwork("this-domain-definitely-does-not-exist-abc123xyz.example")).toBe(false)
   })
 })

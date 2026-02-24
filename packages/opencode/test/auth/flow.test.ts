@@ -721,3 +721,136 @@ describe("deviceCode() (RFC 8628)", () => {
     expect(MAX_DEVICE_CODE_LIFETIME).toBeLessThanOrEqual(3600)
   })
 })
+
+// ---------------------------------------------------------------------------
+// Redirect blocking — all operational endpoint fetches MUST use
+// redirect: "error" to prevent a malicious AS from redirecting
+// sensitive POST bodies (auth codes, PKCE verifiers, client secrets,
+// device codes) to attacker-controlled or internal services.
+// ---------------------------------------------------------------------------
+
+describe("redirect blocking on operational endpoint fetches", () => {
+  const servers: ReturnType<typeof Bun.serve>[] = []
+  afterEach(() => {
+    for (const s of servers) s.stop()
+    servers.length = 0
+  })
+
+  const resource: ResourceMetadata = {
+    resource: "https://api.example.com",
+    scopes_supported: ["read"],
+  }
+
+  const client = { client_id: "test-client" }
+
+  /**
+   * Helper: start a server that responds with a 302 redirect.
+   * If any request arrives at the redirect target, the test fails —
+   * redirect: "error" should prevent the fetch from following it.
+   */
+  function redirectServer(targetPort: number, path: string) {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `http://127.0.0.1:${targetPort}${path}` },
+        })
+      },
+    })
+    servers.push(s)
+    return s
+  }
+
+  function targetServer() {
+    let hit = false
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        hit = true
+        return new Response(JSON.stringify({ error: "redirect_followed" }), { status: 200 })
+      },
+    })
+    servers.push(s)
+    return { server: s, wasHit: () => hit }
+  }
+
+  test("register() rejects redirecting registration_endpoint", async () => {
+    const target = targetServer()
+    const redirector = redirectServer(target.server.port as number, "/steal")
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      registration_endpoint: `http://127.0.0.1:${redirector.port as number}/register`,
+      response_types_supported: ["code"],
+    }
+    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    // Must fail — redirect: "error" causes fetch to throw, caught by .catch()
+    expect(result).toBeUndefined()
+    // The redirect target must never have been contacted
+    expect(target.wasHit()).toBe(false)
+  })
+
+  test("deviceCode() rejects redirecting device_authorization_endpoint", async () => {
+    const target = targetServer()
+    const redirector = redirectServer(target.server.port as number, "/steal")
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${redirector.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${redirector.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    // Must fail — the device authorization request was redirected
+    expect(result).toBeUndefined()
+    expect(target.wasHit()).toBe(false)
+  })
+
+  test("deviceCode() poll rejects redirecting token_endpoint", async () => {
+    // Device authorization succeeds, but token polling endpoint redirects.
+    // redirect: "error" makes the fetch throw, which the poll loop treats as
+    // a network error (exponential backoff). Use a short expires_in so the
+    // poll loop times out quickly instead of retrying for too long.
+    const target = targetServer()
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "dc-redirect",
+              user_code: "REDIR",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: 3,
+              interval: 1,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        // Token endpoint redirects to the target
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `http://127.0.0.1:${target.server.port as number}/steal` },
+        })
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    // poll() should fail — redirect: "error" prevents following the redirect,
+    // and the short expires_in causes the poll loop to time out.
+    const cred = await result!.poll()
+    expect(cred).toBeUndefined()
+    // The redirect target must never have received the device_code
+    expect(target.wasHit()).toBe(false)
+  }, 10000)
+})

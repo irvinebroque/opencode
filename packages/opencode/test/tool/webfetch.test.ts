@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import path from "path"
 import { Instance } from "../../src/project/instance"
 import { WebFetchTool } from "../../src/tool/webfetch"
@@ -107,9 +107,7 @@ describe("tool.webfetch", () => {
 
   test("strips credentials on cross-origin redirect", async () => {
     const calls: Call[] = []
-    const resolve = WebFetchAuth.resolve
-    // Inject a fake credential so the initial fetch carries an Authorization header
-    WebFetchAuth.resolve = async () => ({ Authorization: "Bearer secret" })
+    const spy = spyOn(WebFetchAuth, "resolve").mockResolvedValue({ Authorization: "Bearer secret" })
     try {
       await withFetch(
         async (input, init) => {
@@ -143,14 +141,13 @@ describe("tool.webfetch", () => {
       expect(calls[1].url).toBe("https://evil.com/steal")
       expect(calls[1].headers["authorization"]).toBeUndefined()
     } finally {
-      WebFetchAuth.resolve = resolve
+      spy.mockRestore()
     }
   })
 
   test("preserves credentials on same-origin redirect", async () => {
     const calls: Call[] = []
-    const resolve = WebFetchAuth.resolve
-    WebFetchAuth.resolve = async () => ({ Authorization: "Bearer secret" })
+    const spy = spyOn(WebFetchAuth, "resolve").mockResolvedValue({ Authorization: "Bearer secret" })
     try {
       await withFetch(
         async (input, init) => {
@@ -182,14 +179,13 @@ describe("tool.webfetch", () => {
       expect(calls[1].url).toBe("https://api.example.com/b")
       expect(calls[1].headers["authorization"]).toBe("Bearer secret")
     } finally {
-      WebFetchAuth.resolve = resolve
+      spy.mockRestore()
     }
   })
 
   test("strips credentials on chained same-origin then cross-origin redirect", async () => {
     const calls: Call[] = []
-    const resolve = WebFetchAuth.resolve
-    WebFetchAuth.resolve = async () => ({ Authorization: "Bearer secret" })
+    const spy = spyOn(WebFetchAuth, "resolve").mockResolvedValue({ Authorization: "Bearer secret" })
     try {
       await withFetch(
         async (input, init) => {
@@ -229,7 +225,7 @@ describe("tool.webfetch", () => {
       expect(calls[2].url).toBe("https://evil.com/steal")
       expect(calls[2].headers["authorization"]).toBeUndefined()
     } finally {
-      WebFetchAuth.resolve = resolve
+      spy.mockRestore()
     }
   })
 

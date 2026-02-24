@@ -255,6 +255,15 @@ function oidcMetadataUrl(issuer: string): string {
 const MAX_METADATA_BYTES = 1_048_576
 
 /**
+ * Maximum number of authorization_servers entries to process.
+ * Each entry triggers 1-2 HTTP requests (RFC 8414 + OIDC fallback),
+ * so a malicious resource metadata document with thousands of entries
+ * could be used for request amplification / DoS. Cap at 5 which is
+ * generous for any legitimate deployment.
+ */
+export const MAX_AUTHORIZATION_SERVERS = 5
+
+/**
  * Read response body as JSON, enforcing a byte size limit.
  * Prevents OOM from malicious servers returning multi-gigabyte responses.
  */
@@ -564,8 +573,17 @@ export async function discover(
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
 
+  const entries = meta.authorization_servers
+  if (entries.length > MAX_AUTHORIZATION_SERVERS) {
+    log.error("authorization_servers list exceeds maximum, truncating", {
+      resource,
+      count: entries.length,
+      max: MAX_AUTHORIZATION_SERVERS,
+    })
+  }
+
   const servers: ASMetadata[] = []
-  for (const issuer of meta.authorization_servers) {
+  for (const issuer of entries.slice(0, MAX_AUTHORIZATION_SERVERS)) {
     // SSRF protection: reject loopback AS from non-loopback resource
     const issuerHost = new URL(issuer).hostname
     if (isLoopback(issuerHost) && !fromLoopback) {

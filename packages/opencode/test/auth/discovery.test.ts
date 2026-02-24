@@ -12,6 +12,7 @@ import {
   asMetadataUrl,
   fetchResourceMetadata,
   fetchASMetadata,
+  MAX_AUTHORIZATION_SERVERS,
 } from "../../src/auth/discovery"
 
 // ---------------------------------------------------------------------------
@@ -781,5 +782,65 @@ describe("discover() integration", () => {
 
     expect(result.resource).toBeDefined()
     expect(result.servers).toHaveLength(0)
+  })
+
+  test("caps authorization_servers to MAX_AUTHORIZATION_SERVERS", async () => {
+    // Track how many times the AS server is contacted
+    let fetches = 0
+
+    let asPort = 0
+    const as = Bun.serve({
+      port: 0,
+      fetch() {
+        fetches++
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${asPort}`,
+            authorization_endpoint: `http://127.0.0.1:${asPort}/authorize`,
+            token_endpoint: `http://127.0.0.1:${asPort}/token`,
+            response_types_supported: ["code"],
+            grant_types_supported: ["authorization_code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    asPort = as.port as number
+    servers.push(as)
+
+    // Resource metadata returns well over the cap
+    const count = MAX_AUTHORIZATION_SERVERS + 20
+    let resPort = 0
+    const res = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            resource: `http://127.0.0.1:${resPort}`,
+            authorization_servers: Array.from(
+              { length: count },
+              () => `http://127.0.0.1:${asPort}`,
+            ),
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    resPort = res.port as number
+    servers.push(res)
+
+    const { discover } = await import("../../src/auth/discovery")
+    const result = await discover(
+      `http://127.0.0.1:${resPort}`,
+      `http://127.0.0.1:${resPort}`,
+    )
+
+    // Only MAX_AUTHORIZATION_SERVERS entries should have been fetched
+    expect(result.servers).toHaveLength(MAX_AUTHORIZATION_SERVERS)
+    // AS server should have been contacted at most MAX_AUTHORIZATION_SERVERS
+    // times (each entry triggers one primary fetch, possibly an OIDC fallback,
+    // but never more than 2 per entry).
+    expect(fetches).toBeLessThanOrEqual(MAX_AUTHORIZATION_SERVERS * 2)
+    expect(fetches).toBeGreaterThanOrEqual(MAX_AUTHORIZATION_SERVERS)
   })
 })

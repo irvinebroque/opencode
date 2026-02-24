@@ -11,7 +11,7 @@
 
 import { Log } from "../util/log"
 import type { ASMetadata, ResourceMetadata } from "./discovery"
-import * as WebFetchAuth from "./webfetch-auth"
+import { type Credential, set as storeCredential } from "./webfetch-auth"
 
 const log = Log.create({ service: "webfetch.flow" })
 
@@ -138,7 +138,7 @@ export async function authorizationCode(
   asMeta: ASMetadata,
   client: ClientInfo,
   scopes?: string[],
-): Promise<WebFetchAuth.Credential | undefined> {
+): Promise<Credential | undefined> {
   if (!asMeta.authorization_endpoint || !asMeta.token_endpoint) {
     log.error("AS missing required endpoints", { issuer: asMeta.issuer })
     return undefined
@@ -189,7 +189,7 @@ export async function authorizationCode(
   }
 
   const tokens = (await response.json()) as AuthResult
-  const cred: WebFetchAuth.Credential = {
+  const cred: Credential = {
     resource: resourceMeta.resource,
     scheme: "bearer",
     access_token: tokens.access_token,
@@ -201,7 +201,7 @@ export async function authorizationCode(
     issuer: asMeta.issuer,
   }
 
-  await WebFetchAuth.set(resourceMeta.resource, cred)
+  await storeCredential(resourceMeta.resource, cred)
   return cred
 }
 
@@ -218,7 +218,7 @@ export async function deviceCode(
   asMeta: ASMetadata,
   client: ClientInfo,
   scopes?: string[],
-): Promise<{ info: DeviceInfo; poll: () => Promise<WebFetchAuth.Credential | undefined> } | undefined> {
+): Promise<{ info: DeviceInfo; poll: () => Promise<Credential | undefined> } | undefined> {
   if (!asMeta.device_authorization_endpoint || !asMeta.token_endpoint) {
     log.info("AS does not support device code flow", { issuer: asMeta.issuer })
     return undefined
@@ -257,7 +257,7 @@ export async function deviceCode(
     user_code: data.user_code,
   }
 
-  async function poll(): Promise<WebFetchAuth.Credential | undefined> {
+  async function poll(): Promise<Credential | undefined> {
     while (Date.now() < deadline) {
       await Bun.sleep(interval)
 
@@ -276,7 +276,7 @@ export async function deviceCode(
       const json = (await response.json().catch(() => ({}))) as AuthResult & { error?: string }
 
       if (response.ok && json.access_token) {
-        const cred: WebFetchAuth.Credential = {
+        const cred: Credential = {
           resource: resourceMeta.resource,
           scheme: "bearer",
           access_token: json.access_token,
@@ -287,7 +287,7 @@ export async function deviceCode(
           oauth_client_secret: client.client_secret,
           issuer: asMeta.issuer,
         }
-        await WebFetchAuth.set(resourceMeta.resource, cred)
+        await storeCredential(resourceMeta.resource, cred)
         return cred
       }
 

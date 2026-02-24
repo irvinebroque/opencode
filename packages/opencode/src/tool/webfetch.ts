@@ -1,9 +1,16 @@
 import z from "zod"
 import { Effect } from "effect"
-import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Tool } from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
+import { abortAfterAny } from "../util/abort"
+import { Log } from "../util/log"
+import * as WwwAuthenticate from "../auth/www-authenticate"
+import * as WebFetchAuth from "../auth/webfetch-auth"
+import * as Discovery from "../auth/discovery"
+import * as Flow from "../auth/flow"
+
+const log = Log.create({ service: "webfetch" })
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
@@ -21,9 +28,6 @@ const parameters = z.object({
 export const WebFetchTool = Tool.define(
   "webfetch",
   Effect.gen(function* () {
-    const http = yield* HttpClient.HttpClient
-    const httpOk = HttpClient.filterStatusOk(http)
-
     return {
       description: DESCRIPTION,
       parameters,
@@ -44,113 +48,143 @@ export const WebFetchTool = Tool.define(
             },
           })
 
-          const timeout = Math.min((params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
+          return yield* Effect.promise(async () => {
+            const timeout = Math.min((params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
+            const { signal, clearTimeout } = abortAfterAny(timeout, ctx.abort)
 
-          // Build Accept header based on requested format with q parameters for fallbacks
-          let acceptHeader = "*/*"
-          switch (params.format) {
-            case "markdown":
-              acceptHeader = "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1"
-              break
-            case "text":
-              acceptHeader = "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
-              break
-            case "html":
-              acceptHeader =
-                "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1"
-              break
-            default:
-              acceptHeader =
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-          }
-          const headers = {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
-            Accept: acceptHeader,
-            "Accept-Language": "en-US,en;q=0.9",
-          }
+            try {
+              let accept = "*/*"
+              switch (params.format) {
+                case "markdown":
+                  accept = "text/markdown;q=1.0, text/x-markdown;q=0.9, text/plain;q=0.8, text/html;q=0.7, */*;q=0.1"
+                  break
+                case "text":
+                  accept = "text/plain;q=1.0, text/markdown;q=0.9, text/html;q=0.8, */*;q=0.1"
+                  break
+                case "html":
+                  accept =
+                    "text/html;q=1.0, application/xhtml+xml;q=0.9, text/plain;q=0.8, text/markdown;q=0.7, */*;q=0.1"
+                  break
+                default:
+                  accept =
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+              }
 
-          const request = HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))
+              const headers = {
+                "User-Agent":
+                  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+                Accept: accept,
+                "Accept-Language": "en-US,en;q=0.9",
+              }
 
-          // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
-          const response = yield* httpOk.execute(request).pipe(
-            Effect.catchIf(
-              (err) =>
-                err.reason._tag === "StatusCodeError" &&
-                err.reason.response.status === 403 &&
-                err.reason.response.headers["cf-mitigated"] === "challenge",
-              () =>
-                httpOk.execute(
-                  HttpClientRequest.get(params.url).pipe(
-                    HttpClientRequest.setHeaders({ ...headers, "User-Agent": "opencode" }),
-                  ),
-                ),
-            ),
-            Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.die(new Error("Request timed out")) }),
-          )
-
-          // Check content length
-          const contentLength = response.headers["content-length"]
-          if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
-            throw new Error("Response too large (exceeds 5MB limit)")
-          }
-
-          const arrayBuffer = yield* response.arrayBuffer
-          if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
-            throw new Error("Response too large (exceeds 5MB limit)")
-          }
-
-          const contentType = response.headers["content-type"] || ""
-          const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
-          const title = `${params.url} (${contentType})`
-
-          // Check if response is an image
-          const isImage = mime.startsWith("image/") && mime !== "image/svg+xml" && mime !== "image/vnd.fastbidsheet"
-
-          if (isImage) {
-            const base64Content = Buffer.from(arrayBuffer).toString("base64")
-            return {
-              title,
-              output: "Image fetched successfully",
-              metadata: {},
-              attachments: [
-                {
-                  type: "file" as const,
-                  mime,
-                  url: `data:${mime};base64,${base64Content}`,
-                },
-              ],
-            }
-          }
-
-          const content = new TextDecoder().decode(arrayBuffer)
-
-          // Handle content based on requested format and actual content type
-          switch (params.format) {
-            case "markdown":
-              if (contentType.includes("text/html")) {
-                const markdown = convertHTMLToMarkdown(content)
-                return {
-                  output: markdown,
-                  title,
-                  metadata: {},
+              let stored = await WebFetchAuth.get(params.url).catch(() => undefined)
+              const extra: Record<string, string> = {}
+              if (stored) {
+                if (WebFetchAuth.expired(stored) && stored.refresh_token && stored.issuer) {
+                  const as = await Discovery.fetchASMetadata(stored.issuer)
+                  if (as) {
+                    const refreshed = await WebFetchAuth.refresh(stored, as)
+                    if (refreshed) stored = refreshed
+                  }
+                }
+                if (!WebFetchAuth.expired(stored)) {
+                  Object.assign(extra, WebFetchAuth.headers(stored))
                 }
               }
-              return { output: content, title, metadata: {} }
 
-            case "text":
-              if (contentType.includes("text/html")) {
-                const text = yield* Effect.promise(() => extractTextFromHTML(content))
-                return { output: text, title, metadata: {} }
+              const cfId = process.env.CF_ACCESS_CLIENT_ID
+              const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
+              if (cfId && cfSecret && !Object.keys(extra).length) {
+                extra["CF-Access-Client-Id"] = cfId
+                extra["CF-Access-Client-Secret"] = cfSecret
               }
-              return { output: content, title, metadata: {} }
 
-            case "html":
-              return { output: content, title, metadata: {} }
+              const initial = await fetch(params.url, {
+                signal,
+                headers: { ...headers, ...extra },
+              })
 
-            default:
-              return { output: content, title, metadata: {} }
-          }
+              let response =
+                initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
+                  ? await fetch(params.url, {
+                      signal,
+                      headers: { ...headers, ...extra, "User-Agent": "opencode" },
+                    })
+                  : initial
+
+              if (!response.ok && (response.status === 401 || response.status === 403)) {
+                const authed = await handleAuth(response, params.url, headers, signal, ctx)
+                if (authed) response = authed
+              }
+
+              if (!response.ok) {
+                throw new Error(`Request failed with status code: ${response.status}`)
+              }
+
+              const length = response.headers.get("content-length")
+              if (length && parseInt(length) > MAX_RESPONSE_SIZE) {
+                throw new Error("Response too large (exceeds 5MB limit)")
+              }
+
+              const buffer = await response.arrayBuffer()
+              if (buffer.byteLength > MAX_RESPONSE_SIZE) {
+                throw new Error("Response too large (exceeds 5MB limit)")
+              }
+
+              const contentType = response.headers.get("content-type") || ""
+              const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
+              const title = `${params.url} (${contentType})`
+              const isImage = mime.startsWith("image/") && mime !== "image/svg+xml" && mime !== "image/vnd.fastbidsheet"
+
+              if (isImage) {
+                const base64 = Buffer.from(buffer).toString("base64")
+                return {
+                  title,
+                  output: "Image fetched successfully",
+                  metadata: {},
+                  attachments: [
+                    {
+                      type: "file" as const,
+                      mime,
+                      url: `data:${mime};base64,${base64}`,
+                    },
+                  ],
+                }
+              }
+
+              const content = new TextDecoder().decode(buffer)
+
+              switch (params.format) {
+                case "markdown":
+                  if (contentType.includes("text/html")) {
+                    return {
+                      output: convertHTMLToMarkdown(content),
+                      title,
+                      metadata: {},
+                    }
+                  }
+                  return { output: content, title, metadata: {} }
+
+                case "text":
+                  if (contentType.includes("text/html")) {
+                    return {
+                      output: await extractTextFromHTML(content),
+                      title,
+                      metadata: {},
+                    }
+                  }
+                  return { output: content, title, metadata: {} }
+
+                case "html":
+                  return { output: content, title, metadata: {} }
+
+                default:
+                  return { output: content, title, metadata: {} }
+              }
+            } finally {
+              clearTimeout()
+            }
+          })
         }).pipe(Effect.orDie),
     }
   }),
@@ -198,4 +232,164 @@ function convertHTMLToMarkdown(html: string): string {
   })
   turndownService.remove(["script", "style", "meta", "link"])
   return turndownService.turndown(html)
+}
+
+// Detect CF Access login pages: redirect to *.cloudflareaccess.com or body markers
+function isCfAccess(response: Response): boolean {
+  const location = response.headers.get("location") ?? ""
+  if (location.includes("cloudflareaccess.com")) return true
+  // cf-mitigated without "challenge" (which is bot detection) could indicate Access
+  const mitigated = response.headers.get("cf-mitigated")
+  if (mitigated && mitigated !== "challenge") return true
+  return false
+}
+
+async function handleAuth(
+  response: Response,
+  url: string,
+  base: Record<string, string>,
+  signal: AbortSignal,
+  ctx: Tool.Context,
+): Promise<Response | undefined> {
+  log.info("auth required", { url, status: response.status })
+
+  // 1. Parse WWW-Authenticate challenges
+  const challenges = WwwAuthenticate.all(response)
+  const metaUrl = WwwAuthenticate.resourceMetadataUrl(challenges)
+
+  // 2. Check for CF Access service token env vars on 403
+  if (response.status === 403 || isCfAccess(response)) {
+    const cfId = process.env.CF_ACCESS_CLIENT_ID
+    const cfSecret = process.env.CF_ACCESS_CLIENT_SECRET
+    if (cfId && cfSecret) {
+      log.info("retrying with CF Access service token", { url })
+      const retry = await fetch(url, {
+        signal,
+        headers: {
+          ...base,
+          "CF-Access-Client-Id": cfId,
+          "CF-Access-Client-Secret": cfSecret,
+        },
+      })
+      if (retry.ok) {
+        // Store for future use
+        await WebFetchAuth.set(new URL(url).origin, {
+          resource: new URL(url).origin,
+          scheme: "service-token",
+          client_id: cfId,
+          client_secret: cfSecret,
+        })
+        return retry
+      }
+    }
+  }
+
+  // 3. RFC 9728 / RFC 8414 discovery
+  const discovery = await Discovery.discover(url, metaUrl ?? undefined)
+
+  if (!discovery.resource || !discovery.servers.length) {
+    // If only Basic auth is offered, we could prompt for credentials
+    const basic = challenges.find((c) => c.scheme.toLowerCase() === "basic")
+    if (basic) {
+      log.info("basic auth challenge detected", { realm: basic.params["realm"] })
+      // For now, return informative error rather than prompting
+      throw new Error(
+        `This URL requires Basic authentication (realm: ${basic.params["realm"] ?? "unknown"}). ` +
+          `Configure credentials via CF_ACCESS_CLIENT_ID/CF_ACCESS_CLIENT_SECRET env vars ` +
+          `or set up a service token for this origin.`,
+      )
+    }
+
+    log.info("no auth discovery available", { url, challenges: challenges.length })
+    return undefined
+  }
+
+  const server = discovery.servers[0]
+
+  // 4. Resolve client credentials
+  let client: { client_id: string; client_secret?: string } | undefined
+
+  // Try stored OAuth client from previous registration
+  const existing = await WebFetchAuth.get(url).catch(() => undefined)
+  if (existing?.oauth_client_id) {
+    client = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
+  }
+
+  // Try dynamic client registration
+  if (!client && server.registration_endpoint) {
+    const redirectUri = `http://127.0.0.1:19877/webfetch/oauth/callback`
+    client = await Flow.register(server, redirectUri) ?? undefined
+  }
+
+  if (!client) {
+    const docs = server.service_documentation ?? server.issuer
+    throw new Error(
+      `This URL requires OAuth authentication via ${server.issuer}, ` +
+        `but no client_id is configured and dynamic registration is not available. ` +
+        `Register a client at ${docs} and configure it in opencode.json.`,
+    )
+  }
+
+  // 5. Prompt user for consent
+  await Effect.runPromise(
+    ctx.ask({
+      permission: "webfetch",
+      patterns: [url],
+      always: [new URL(url).origin + "/*"],
+      metadata: {
+        url,
+        action: "authenticate",
+        server: server.issuer,
+        scopes: discovery.resource.scopes_supported?.join(", ") ?? "default",
+      },
+    }),
+  )
+
+  // 6. Execute OAuth flow (prefer auth code + PKCE)
+  const supports = server.grant_types_supported ?? ["authorization_code"]
+
+  let cred: WebFetchAuth.Credential | undefined
+
+  if (supports.includes("authorization_code") && server.authorization_endpoint) {
+    cred = await Flow.authorizationCode(
+      url,
+      discovery.resource,
+      server,
+      client,
+      discovery.resource.scopes_supported,
+    )
+  }
+
+  // Fallback to device code flow
+  if (!cred && supports.includes("urn:ietf:params:oauth:grant-type:device_code") && server.device_authorization_endpoint) {
+    const device = await Flow.deviceCode(
+      url,
+      discovery.resource,
+      server,
+      client,
+      discovery.resource.scopes_supported,
+    )
+    if (device) {
+      log.info("device code flow", {
+        uri: device.info.verification_uri,
+        code: device.info.user_code,
+      })
+      cred = await device.poll()
+    }
+  }
+
+  if (!cred) {
+    throw new Error(`OAuth authentication failed for ${url}. Please try again.`)
+  }
+
+  // 7. Retry with credentials
+  const retry = await fetch(url, {
+    signal,
+    headers: { ...base, ...WebFetchAuth.headers(cred) },
+  })
+
+  if (retry.ok) return retry
+
+  log.error("auth retry failed", { url, status: retry.status })
+  return undefined
 }

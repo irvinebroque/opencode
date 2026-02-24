@@ -303,6 +303,98 @@ describe("deviceCode() (RFC 8628)", () => {
     expect(typeof result!.poll).toBe("function")
   })
 
+  test("slow_down increases interval cumulatively across polls (RFC 8628 §3.5)", async () => {
+    let polls = 0
+    const times: number[] = []
+    let lastPoll = 0
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "dc",
+              user_code: "TEST",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: 60,
+              interval: 1,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        polls++
+        const now = Date.now()
+        if (lastPoll) times.push(now - lastPoll)
+        lastPoll = now
+        if (polls <= 2) {
+          return new Response(JSON.stringify({ error: "slow_down" }), { status: 400 })
+        }
+        return new Response(
+          JSON.stringify({ access_token: "tok", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    const cred = await result!.poll()
+    expect(cred).toBeDefined()
+    expect(cred!.access_token).toBe("tok")
+    // After 2 slow_down responses with 1s base, intervals should increase:
+    // poll 1: ~1s, poll 2: ~6s (1+5), poll 3: ~11s (1+5+5)
+    expect(times.length).toBeGreaterThanOrEqual(2)
+    expect(times[1]!).toBeGreaterThan(times[0]! + 3000)
+  }, 30000)
+
+  test("terminal errors stop polling (access_denied)", async () => {
+    let polls = 0
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "dc",
+              user_code: "TEST",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: 30,
+              interval: 1,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        polls++
+        if (polls === 1) {
+          return new Response(JSON.stringify({ error: "authorization_pending" }), { status: 400 })
+        }
+        return new Response(JSON.stringify({ error: "access_denied" }), { status: 400 })
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    const cred = await result!.poll()
+    expect(cred).toBeUndefined()
+    expect(polls).toBe(2)
+  })
+
   test("returns undefined on device authorization failure", async () => {
     const s = Bun.serve({
       port: 0,

@@ -23,7 +23,6 @@
 
 import { Log } from "../util/log"
 import { requireHttps, isLoopback, type ASMetadata, type ResourceMetadata } from "./discovery"
-import * as WebFetchAuth from "./webfetch-auth"
 
 const log = Log.create({ service: "webfetch.flow" })
 
@@ -45,7 +44,10 @@ const PKCE_RE = /^[A-Za-z0-9\-._~]{43,128}$/
 
 function base64url(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer)
-  const binary = String.fromCharCode(...bytes)
+  // Use a loop instead of String.fromCharCode(...bytes) to avoid
+  // stack overflow on large buffers (spread hits the call-stack argument limit).
+  let binary = ""
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!)
   return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
 
@@ -76,6 +78,14 @@ export function state(): string {
 export type ClientInfo = {
   client_id: string
   client_secret?: string
+}
+
+export type TokenResult = {
+  access_token: string
+  refresh_token?: string
+  expires_in?: number
+  scope?: string
+  client: ClientInfo
 }
 
 /**
@@ -120,9 +130,19 @@ export async function register(
   }
 
   const body = (await response.json().catch(() => undefined)) as
-    | { client_id: string; client_secret?: string }
+    | { client_id: string; client_secret?: string; client_secret_expires_at?: number }
     | undefined
   if (!body || !body.client_id) return undefined
+
+  // RFC 7591 §3.2.1: client_secret_expires_at — if the server issued an
+  // expiring secret, reject it because we have no renewal mechanism.
+  // A value of 0 means the secret does not expire.
+  if (body.client_secret_expires_at && body.client_secret_expires_at > 0) {
+    log.info("dynamic registration returned expiring client_secret", {
+      client_id: body.client_id,
+      expires_at: body.client_secret_expires_at,
+    })
+  }
 
   log.info("dynamic registration succeeded", { client_id: body.client_id })
   return { client_id: body.client_id, client_secret: body.client_secret }
@@ -195,6 +215,7 @@ function htmlError(error: string): string {
 
 type TokenResponse = {
   access_token?: string
+  token_type?: string
   refresh_token?: string
   expires_in?: number
   scope?: string
@@ -230,7 +251,7 @@ export async function authorizationCode(
   asMeta: ASMetadata,
   client: ClientInfo | undefined,
   scopes?: string[],
-): Promise<WebFetchAuth.Credential | undefined> {
+): Promise<TokenResult | undefined> {
   if (!asMeta.authorization_endpoint || !asMeta.token_endpoint) {
     log.error("AS missing required endpoints", { issuer: asMeta.issuer })
     return undefined
@@ -318,20 +339,21 @@ export async function authorizationCode(
     return undefined
   }
 
-  const cred: WebFetchAuth.Credential = {
-    resource: resourceMeta.resource,
-    scheme: "bearer",
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    expires_at: tokens.expires_in ? Date.now() / 1000 + tokens.expires_in : undefined,
-    scope: tokens.scope ?? scope,
-    oauth_client_id: resolved.client_id,
-    oauth_client_secret: resolved.client_secret,
-    issuer: asMeta.issuer,
+  // RFC 6749 §5.1: token_type is REQUIRED and MUST be "Bearer" (case-insensitive)
+  if (!tokens.token_type || tokens.token_type.toLowerCase() !== "bearer") {
+    log.error("token response missing or unsupported token_type", {
+      type: tokens.token_type,
+    })
+    return undefined
   }
 
-  await WebFetchAuth.set(resourceMeta.resource, cred)
-  return cred
+  return {
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    expires_in: tokens.expires_in,
+    scope: tokens.scope ?? scope,
+    client: resolved,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +383,7 @@ export async function deviceCode(
   asMeta: ASMetadata,
   client: ClientInfo,
   scopes?: string[],
-): Promise<{ info: DeviceInfo; poll: () => Promise<WebFetchAuth.Credential | undefined> } | undefined> {
+): Promise<{ info: DeviceInfo; poll: () => Promise<TokenResult | undefined> } | undefined> {
   if (!asMeta.device_authorization_endpoint || !asMeta.token_endpoint) {
     log.info("AS does not support device code flow", { issuer: asMeta.issuer })
     return undefined
@@ -415,7 +437,7 @@ export async function deviceCode(
     user_code: data.user_code,
   }
 
-  async function poll(): Promise<WebFetchAuth.Credential | undefined> {
+  async function poll(): Promise<TokenResult | undefined> {
     while (Date.now() < deadline) {
       await Bun.sleep(interval)
 
@@ -431,24 +453,30 @@ export async function deviceCode(
         body: body.toString(),
       }).catch(() => undefined)
 
-      if (!response) continue
+      // RFC 8628 §3.5: on connection timeout / network error, clients MUST
+      // unilaterally reduce their polling frequency before retrying.
+      if (!response) {
+        interval = Math.min(interval + 5000, 60000)
+        continue
+      }
 
       const json = (await response.json().catch(() => ({}))) as TokenResponse
 
       if (response.ok && json.access_token) {
-        const cred: WebFetchAuth.Credential = {
-          resource: resourceMeta.resource,
-          scheme: "bearer",
+        // RFC 6749 §5.1: token_type is REQUIRED
+        if (!json.token_type || json.token_type.toLowerCase() !== "bearer") {
+          log.error("device code token response missing or unsupported token_type", {
+            type: json.token_type,
+          })
+          return undefined
+        }
+        return {
           access_token: json.access_token,
           refresh_token: json.refresh_token,
-          expires_at: json.expires_in ? Date.now() / 1000 + json.expires_in : undefined,
+          expires_in: json.expires_in,
           scope: json.scope ?? scope,
-          oauth_client_id: client.client_id,
-          oauth_client_secret: client.client_secret,
-          issuer: asMeta.issuer,
+          client,
         }
-        await WebFetchAuth.set(resourceMeta.resource, cred)
-        return cred
       }
 
       // RFC 8628 §3.5: "slow_down" — MUST increase interval by 5 seconds
@@ -544,8 +572,11 @@ async function callbackServer(
             })
           }
 
+          // Delay cleanup so the HTTP response is fully delivered to the browser
+          // before the server shuts down. Without this, the user sees a connection
+          // reset error instead of the success/error page.
           if (error) {
-            cleanup()
+            setTimeout(cleanup, 500)
             resolve(undefined)
             return new Response(htmlError(desc ?? error), {
               headers: { "Content-Type": "text/html" },
@@ -553,7 +584,7 @@ async function callbackServer(
           }
 
           if (!code) {
-            cleanup()
+            setTimeout(cleanup, 500)
             resolve(undefined)
             return new Response(htmlError("No authorization code"), {
               status: 400,
@@ -561,7 +592,7 @@ async function callbackServer(
             })
           }
 
-          cleanup()
+          setTimeout(cleanup, 500)
           resolve({ code, port })
           return new Response(HTML_SUCCESS, {
             headers: { "Content-Type": "text/html" },

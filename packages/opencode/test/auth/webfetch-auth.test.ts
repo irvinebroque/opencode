@@ -146,6 +146,16 @@ describe("headers()", () => {
     const decoded = Buffer.from(result.Authorization!.replace("Basic ", ""), "base64").toString("utf-8")
     expect(decoded).toBe(":")
   })
+
+  test("rejects username containing : (RFC 7617 §2)", () => {
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "basic",
+      username: "user:name",
+      password: "pass",
+    }
+    expect(headers(cred)).toEqual({})
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -216,6 +226,32 @@ describe("get() prefix matching", () => {
   test("returns undefined when no match exists", async () => {
     const result = await get("https://nomatch.example.com/resource")
     expect(result).toBeUndefined()
+  })
+
+  test("does not leak credentials across origins (evil.com attack)", async () => {
+    const cred: Credential = {
+      resource: "https://api.example.com",
+      scheme: "bearer",
+      access_token: "secret-token",
+    }
+    await set("https://api.example.com", cred)
+    // api.example.com.evil.com is a different origin — must NOT match
+    const result = await get("https://api.example.com.evil.com/steal")
+    expect(result).toBeUndefined()
+    await remove("https://api.example.com")
+  })
+
+  test("does not match prefix at non-path boundary", async () => {
+    const cred: Credential = {
+      resource: "https://api.example.com/v1",
+      scheme: "bearer",
+      access_token: "v1-token",
+    }
+    await set("https://api.example.com/v1", cred)
+    // /v1extra is not a path boundary match for /v1
+    const result = await get("https://api.example.com/v1extra")
+    expect(result).toBeUndefined()
+    await remove("https://api.example.com/v1")
   })
 })
 

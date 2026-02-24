@@ -1,9 +1,9 @@
 /**
  * Auth orchestration for webfetch — Layer 2.
  *
- * Handles the full OAuth flow when webfetch encounters a 401/403:
+ * Handles the full OAuth flow when webfetch encounters a WWW-Authenticate challenge:
  *
- * Flow: 401/403 -> parse WWW-Authenticate (RFC 9110 §11.6.1)
+ * Flow: challenge response -> parse WWW-Authenticate (RFC 9110 §11.6.1)
  *       -> discover resource metadata (RFC 9728)
  *       -> discover AS metadata (RFC 8414)
  *       -> dynamic client registration (RFC 7591) or use stored client
@@ -35,8 +35,25 @@ function credential(resource: string, tokens: Flow.TokenResult, issuer: string):
   }
 }
 
+function authMethodHint(resource: Discovery.ResourceMetadata): string {
+  const raw = resource as Record<string, unknown>
+  if (typeof raw.authentication_method !== "string") return ""
+  if (raw.authentication_method.toLowerCase() === "oauth") return ""
+  const description = typeof raw.authentication_method_description === "string"
+    ? raw.authentication_method_description
+    : undefined
+  const docs = typeof raw.authentication_method_documentation === "string"
+    ? raw.authentication_method_documentation
+    : undefined
+  const method = `Resource metadata advertises authentication_method="${raw.authentication_method}".`
+  if (description && docs) return `${method} ${description} Docs: ${docs}`
+  if (description) return `${method} ${description}`
+  if (docs) return `${method} Docs: ${docs}`
+  return method
+}
+
 /**
- * Handle an auth challenge (401/403) by running the full interactive OAuth flow.
+ * Handle an auth challenge by running the full interactive OAuth flow.
  *
  * This is Layer 2: discovery, consent, browser auth or device code, token
  * exchange, credential storage, retry. The consumer calls this explicitly
@@ -116,27 +133,34 @@ export async function handleAuthChallenge(options: {
 
   // 5. Execute OAuth flow — RFC 6749 §4.1 (auth code) + RFC 7636 (PKCE)
   const supports = server.grant_types_supported ?? ["authorization_code"]
+  const canRegister = Boolean(server.registration_endpoint)
   let cred: Credential | undefined
+  let failure = ""
 
   const registration = options.client ?? { name: "OAuth Client" }
 
   if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
-    const tokens = await Flow.authorizationCode(
-      options.url,
-      result.resource,
-      server,
-      resolved,
-      result.resource.scopes_supported,
-      {
-        server: options.callbackServer,
-        interaction: options.interaction,
-        registration,
-        logger: log,
-      },
-    )
-    if (tokens) {
-      cred = credential(result.resource.resource, tokens, server.issuer)
-      await options.store.set(result.resource.resource, cred)
+    try {
+      const tokens = await Flow.authorizationCode(
+        options.url,
+        result.resource,
+        server,
+        resolved,
+        result.resource.scopes_supported,
+        {
+          server: options.callbackServer,
+          interaction: options.interaction,
+          registration,
+          logger: log,
+        },
+      )
+      if (tokens) {
+        cred = credential(result.resource.resource, tokens, server.issuer)
+        await options.store.set(result.resource.resource, cred)
+      }
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : String(cause)
+      log.error("authorization code flow failed", { error: failure, resource: options.url })
     }
   }
 
@@ -182,7 +206,13 @@ export async function handleAuthChallenge(options: {
   }
 
   if (!cred) {
-    if (!resolved) {
+    const hint = authMethodHint(result.resource)
+    if (failure) {
+      throw new Error(
+        `OAuth authentication failed for ${options.url}: ${failure}${hint ? ` ${hint}` : ""}`,
+      )
+    }
+    if (!resolved && !canRegister) {
       const docs = server.service_documentation ?? server.issuer
       throw new Error(
         `This URL requires OAuth authentication via ${server.issuer}, ` +

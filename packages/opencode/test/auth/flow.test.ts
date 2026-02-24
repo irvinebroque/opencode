@@ -11,7 +11,7 @@
  * - Device code expires_in validation and clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { pkce, state, register, deviceCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
+import { pkce, state, register, authorizationCode, deviceCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
 import type { ASMetadata, ResourceMetadata } from "../../src/auth/discovery"
 
 // RFC 7636 §4.1: code_verifier character set
@@ -280,6 +280,40 @@ describe("register() (RFC 7591)", () => {
     expect(result).toBeDefined()
     expect(result!.client_id).toBe("permanent-client")
     expect(result!.client_secret).toBe("permanent-secret")
+  })
+})
+
+describe("authorizationCode()", () => {
+  test("propagates callback authorization errors", async () => {
+    const result = authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com" },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: "https://as.example.com/authorize",
+        token_endpoint: "https://as.example.com/token",
+        response_types_supported: ["code"],
+      },
+      { client_id: "test-client" },
+      ["read"],
+      {
+        server: {
+          start: async () => ({ redirectUri: "http://127.0.0.1:19877/oauth/callback" }),
+          waitForCode: async () => {
+            throw new Error("Authorization error: invalid_target: OAuth not enabled")
+          },
+          stop: async () => {},
+        },
+        interaction: {
+          askConsent: async () => {},
+          openUrl: async () => {},
+          showDeviceCode: async () => {},
+        },
+        registration: { name: "OpenCode", uri: "https://opencode.ai" },
+      },
+    )
+
+    await expect(result).rejects.toThrow("invalid_target")
   })
 })
 

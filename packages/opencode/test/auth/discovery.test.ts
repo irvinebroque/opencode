@@ -407,6 +407,29 @@ describe("fetchASMetadata validation", () => {
     expect(result).toBeUndefined()
   })
 
+  test("normalizes metadata issuer without scheme when it matches expected issuer", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            response_types_supported: ["code"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeDefined()
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+  })
+
   test("rejects metadata missing response_types_supported (RFC 8414 §2)", async () => {
     // Must create server first to know port for issuer match
     let port = 0

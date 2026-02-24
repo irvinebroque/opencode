@@ -97,4 +97,37 @@ describe("tool.webfetch", () => {
       },
     )
   })
+
+  test("follows non-auth redirects after manual challenge probe", async () => {
+    const calls: RequestInit[] = []
+
+    await withFetch(
+      async (_input, init) => {
+        calls.push(init ?? {})
+        if ((init?.redirect ?? "follow") === "manual") {
+          return new Response("", {
+            status: 302,
+            headers: { location: "https://example.com/next" },
+          })
+        }
+        return new Response("redirect target", {
+          status: 200,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        })
+      },
+      async () => {
+        await Instance.provide({
+          directory: projectRoot,
+          fn: async () => {
+            const webfetch = await WebFetchTool.init()
+            const result = await webfetch.execute({ url: "https://example.com/redirect", format: "text" }, ctx)
+            expect(result.output).toBe("redirect target")
+            expect(calls.length).toBe(2)
+            expect(calls[0]?.redirect).toBe("manual")
+            expect(calls[1]?.redirect).toBeUndefined()
+          },
+        })
+      },
+    )
+  })
 })

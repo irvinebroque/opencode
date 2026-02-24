@@ -224,7 +224,7 @@ export class LocalCallbackServer implements CallbackServer {
           clearTimeout(timer)
           // Delay cleanup so the HTTP response is fully delivered
           setTimeout(() => this.stop(), 500)
-          reject(new Error(`Authorization error: ${desc ?? error}`))
+          reject(new Error(`Authorization error: ${error}${desc ? `: ${desc}` : ""}`))
           return
         }
 
@@ -516,12 +516,7 @@ export async function authorizationCode(
   log.info("opened authorization URL", { host: new URL(authUrl).host })
 
   // Wait for the callback with the authorization code
-  let code: string
-  try {
-    code = await opts.server.waitForCode(st)
-  } catch {
-    return undefined
-  }
+  const code = await opts.server.waitForCode(st)
 
   // Exchange code for tokens — RFC 6749 §4.1.3
   const body = new URLSearchParams({

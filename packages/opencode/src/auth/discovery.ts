@@ -323,6 +323,15 @@ function validateIssuer(issuer: string): boolean {
   return true
 }
 
+function normalizeIssuer(raw: string, expected: string): string | undefined {
+  if (validateIssuer(raw)) return raw
+  if (raw.includes("://")) return undefined
+  const protocol = new URL(expected).protocol
+  const out = `${protocol}//${raw}`
+  if (!validateIssuer(out)) return undefined
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // Field-level validation
 // ---------------------------------------------------------------------------
@@ -697,12 +706,18 @@ export async function fetchASMetadata(
   }
 
   const metadata = obj as ASMetadata
+  const value = normalizeIssuer(metadata.issuer, issuer)
+  if (!value) {
+    log.error("AS metadata issuer invalid", { expected: issuer, got: metadata.issuer })
+    return undefined
+  }
 
   // RFC 8414 §3.3: issuer must exactly match
-  if (metadata.issuer !== issuer) {
+  if (value !== issuer) {
     log.error("AS metadata issuer mismatch", { expected: issuer, got: metadata.issuer })
     return undefined
   }
+  metadata.issuer = value
 
   // RFC 8414 §2: response_types_supported is REQUIRED
   if (!Array.isArray(metadata.response_types_supported) || metadata.response_types_supported.length === 0) {

@@ -72,15 +72,26 @@ export const WebFetchTool = Tool.define("webfetch", {
     // Layer 1: resolve stored credentials (local lookup, auto-refresh)
     const auth = await resolveCredentials(params.url, store, log)
 
-    const initial = await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth } })
+    const probe = await fetch(params.url, {
+      signal: timer.signal,
+      redirect: "manual",
+      headers: { ...headers, ...auth },
+    })
 
     // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
     let response =
-      initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
-        ? await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth, "User-Agent": "opencode" } })
-        : initial
+      probe.status === 403 && probe.headers.get("cf-mitigated") === "challenge"
+        ? await fetch(params.url, {
+            signal: timer.signal,
+            redirect: "manual",
+            headers: { ...headers, ...auth, "User-Agent": "opencode" },
+          })
+        : probe
 
-    // Auth handling: detect 401 and attempt RFC 9728/8414 authentication.
+    // Auth handling: detect explicit WWW-Authenticate challenges and
+    // attempt RFC 9728/8414 authentication.
+    // Trigger on redirect statuses too because some servers return the
+    // auth challenge on 302 instead of 401/403.
     // Only trigger on 403 if the server explicitly sent a WWW-Authenticate
     // header — a bare 403 means "forbidden" (not an auth challenge) and a
     // malicious server could abuse it to social-engineer the user into
@@ -88,9 +99,22 @@ export const WebFetchTool = Tool.define("webfetch", {
     // Clear the request timeout before entering the OAuth flow — the interactive
     // browser authorization may take minutes, and the 30s/120s timeout would
     // abort the signal mid-flow. The retry fetch uses ctx.abort instead.
-    const tryAuth =
-      response.status === 401 ||
-      (response.status === 403 && response.headers.has("www-authenticate"))
+    const challenge = response.headers.has("www-authenticate")
+    const redirect = response.status >= 300 && response.status < 400
+    const tryAuth = response.status === 401 || (response.status === 403 && challenge) || (redirect && challenge)
+    async function follow() {
+      let next = await fetch(params.url, {
+        signal: ctx.abort,
+        headers: { ...headers, ...auth },
+      })
+      if (next.status === 403 && next.headers.get("cf-mitigated") === "challenge") {
+        next = await fetch(params.url, {
+          signal: ctx.abort,
+          headers: { ...headers, ...auth, "User-Agent": "opencode" },
+        })
+      }
+      return next
+    }
     if (!response.ok && tryAuth) {
       timer.clearTimeout()
 
@@ -127,20 +151,35 @@ export const WebFetchTool = Tool.define("webfetch", {
         },
       }
 
-      const authed = await handleAuthChallenge({
-        response,
-        url: params.url,
-        baseHeaders: headers,
-        signal: ctx.abort,
-        store,
-        interaction,
-        callbackServer: new LocalCallbackServer(),
-        client: { name: "OpenCode", uri: "https://opencode.ai" },
-        logger: log,
-      })
+      let authed: Response | undefined
+      let error: unknown
+      try {
+        authed = await handleAuthChallenge({
+          response,
+          url: params.url,
+          baseHeaders: headers,
+          signal: ctx.abort,
+          store,
+          interaction,
+          callbackServer: new LocalCallbackServer(),
+          client: { name: "OpenCode", uri: "https://opencode.ai" },
+          logger: log,
+        })
+      } catch (cause) {
+        error = cause
+      }
       if (authed) response = authed
+      if (!authed && error) throw error
+      if (!authed && redirect) {
+        response = await follow()
+      }
     } else {
       timer.clearTimeout()
+
+      // No auth challenge; perform a normal fetch that follows redirects.
+      if (redirect) {
+        response = await follow()
+      }
     }
 
     if (!response.ok) {

@@ -87,6 +87,126 @@ export function isLoopback(hostname: string): boolean {
   return LOOPBACK.has(hostname)
 }
 
+// ---------------------------------------------------------------------------
+// Private network detection — SSRF protection
+// ---------------------------------------------------------------------------
+
+/** Parse an IPv4 address string into 4 octets, or undefined if invalid. */
+function parseV4(host: string): number[] | undefined {
+  const parts = host.split(".")
+  if (parts.length !== 4) return undefined
+  const bytes = parts.map(Number)
+  if (bytes.some((b) => !Number.isInteger(b) || b < 0 || b > 255)) return undefined
+  return bytes
+}
+
+/** Check if IPv4 octets belong to a private, loopback, or link-local range. */
+function privateV4(o: number[]): boolean {
+  if (o[0] === 0) return true                                   // 0.0.0.0/8
+  if (o[0] === 10) return true                                  // 10.0.0.0/8
+  if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true   // 100.64.0.0/10 (RFC 6598)
+  if (o[0] === 127) return true                                 // 127.0.0.0/8
+  if (o[0] === 169 && o[1] === 254) return true                 // 169.254.0.0/16 (link-local / cloud metadata)
+  if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true    // 172.16.0.0/12
+  if (o[0] === 192 && o[1] === 168) return true                 // 192.168.0.0/16
+  return false
+}
+
+/** Expand an IPv6 address string to 8 groups of 16-bit values. */
+function expandV6(raw: string): number[] | undefined {
+  // Strip zone ID (e.g. %eth0 or %25eth0)
+  const addr = raw.includes("%") ? raw.slice(0, raw.indexOf("%")) : raw
+
+  // Handle IPv4-mapped suffix (::ffff:1.2.3.4)
+  const last = addr.lastIndexOf(":")
+  const tail = addr.slice(last + 1)
+  if (tail.includes(".")) {
+    const v4 = parseV4(tail)
+    if (!v4) return undefined
+    const hex =
+      ((v4[0] << 8) | v4[1]).toString(16) +
+      ":" +
+      ((v4[2] << 8) | v4[3]).toString(16)
+    return expandV6(addr.slice(0, last + 1) + hex)
+  }
+
+  const halves = addr.split("::")
+  if (halves.length > 2) return undefined
+
+  const parse = (s: string) =>
+    s === "" ? [] : s.split(":").map((g) => parseInt(g, 16))
+  const left = parse(halves[0])
+  const right = halves.length === 2 ? parse(halves[1]) : []
+  if (left.some(isNaN) || right.some(isNaN)) return undefined
+
+  const pad = 8 - left.length - right.length
+  if (pad < 0 || (halves.length === 1 && pad !== 0)) return undefined
+
+  return [...left, ...new Array(pad).fill(0), ...right]
+}
+
+/**
+ * Check whether a hostname is a private, loopback, or link-local IP address.
+ *
+ * Used for SSRF protection to block requests targeting internal networks.
+ * Covers RFC 1918 (10/8, 172.16/12, 192.168/16), RFC 6598 (100.64/10),
+ * loopback (127/8), link-local (169.254/16 — including cloud metadata at
+ * 169.254.169.254), and IPv6 equivalents (::1, fc00::/7, fe80::/10,
+ * IPv4-mapped addresses).
+ */
+export function isPrivateNetwork(hostname: string): boolean {
+  const host = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname
+
+  // IPv4
+  const v4 = parseV4(host)
+  if (v4) return privateV4(v4)
+
+  // IPv6
+  const groups = expandV6(host.toLowerCase())
+  if (!groups || groups.length !== 8) return false
+
+  // ::1 loopback
+  if (
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0 &&
+    groups[6] === 0 &&
+    groups[7] === 1
+  )
+    return true
+
+  // :: unspecified
+  if (groups.every((g) => g === 0)) return true
+
+  // fc00::/7 unique local
+  if ((groups[0] & 0xfe00) === 0xfc00) return true
+
+  // fe80::/10 link-local
+  if ((groups[0] & 0xffc0) === 0xfe80) return true
+
+  // ::ffff:0:0/96 IPv4-mapped — check the embedded IPv4
+  if (
+    groups[0] === 0 &&
+    groups[1] === 0 &&
+    groups[2] === 0 &&
+    groups[3] === 0 &&
+    groups[4] === 0 &&
+    groups[5] === 0xffff
+  ) {
+    return privateV4([
+      (groups[6] >> 8) & 0xff,
+      groups[6] & 0xff,
+      (groups[7] >> 8) & 0xff,
+      groups[7] & 0xff,
+    ])
+  }
+
+  return false
+}
+
 /**
  * Validate a resource identifier per RFC 9728 §2:
  * - MUST use https scheme
@@ -253,15 +373,6 @@ function oidcMetadataUrl(issuer: string): string {
 
 /** Maximum metadata response size (1 MiB). Prevents OOM from malicious servers. */
 const MAX_METADATA_BYTES = 1_048_576
-
-/**
- * Maximum number of authorization_servers entries to process.
- * Each entry triggers 1-2 HTTP requests (RFC 8414 + OIDC fallback),
- * so a malicious resource metadata document with thousands of entries
- * could be used for request amplification / DoS. Cap at 5 which is
- * generous for any legitimate deployment.
- */
-export const MAX_AUTHORIZATION_SERVERS = 5
 
 /**
  * Read response body as JSON, enforcing a byte size limit.
@@ -551,15 +662,17 @@ export async function discover(
   signal?: AbortSignal,
 ): Promise<{ resource?: ResourceMetadata; servers: ASMetadata[] }> {
   const resourceHost = new URL(resource).hostname
-  const fromLoopback = isLoopback(resourceHost)
+  const local = isPrivateNetwork(resourceHost)
 
-  // SSRF protection: reject loopback metadata URLs from non-loopback resources.
+  // SSRF protection: reject private-network metadata URLs from public resources.
   // A malicious server could return 401 with resource_metadata pointing at
-  // http://127.0.0.1:PORT/... to probe local services.
+  // http://169.254.169.254/... (cloud metadata) or http://10.x.x.x/... to
+  // probe internal services. Only allow private targets when the resource
+  // itself is on a private network (e.g. local development).
   if (metadataUrl) {
     const metaHost = new URL(metadataUrl).hostname
-    if (isLoopback(metaHost) && !fromLoopback) {
-      log.error("rejecting loopback metadata URL from non-loopback resource", {
+    if (isPrivateNetwork(metaHost) && !local) {
+      log.error("rejecting private-network metadata URL from public resource", {
         resource,
         metadataUrl,
       })
@@ -573,21 +686,12 @@ export async function discover(
   if (!meta || !meta.authorization_servers?.length)
     return { resource: meta, servers: [] }
 
-  const entries = meta.authorization_servers
-  if (entries.length > MAX_AUTHORIZATION_SERVERS) {
-    log.error("authorization_servers list exceeds maximum, truncating", {
-      resource,
-      count: entries.length,
-      max: MAX_AUTHORIZATION_SERVERS,
-    })
-  }
-
   const servers: ASMetadata[] = []
-  for (const issuer of entries.slice(0, MAX_AUTHORIZATION_SERVERS)) {
-    // SSRF protection: reject loopback AS from non-loopback resource
+  for (const issuer of meta.authorization_servers) {
+    // SSRF protection: reject private-network AS from public resource
     const issuerHost = new URL(issuer).hostname
-    if (isLoopback(issuerHost) && !fromLoopback) {
-      log.error("rejecting loopback AS from non-loopback resource", { resource, issuer })
+    if (isPrivateNetwork(issuerHost) && !local) {
+      log.error("rejecting private-network AS from public resource", { resource, issuer })
       continue
     }
     const as = await fetchASMetadata(issuer, signal)

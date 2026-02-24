@@ -441,7 +441,18 @@ export async function deviceCode(
   // RFC 8628 §3.2: default polling interval is 5 seconds.
   // Clamp minimum to 1s to prevent tight-loop polling from a malicious AS.
   let interval = Math.max(data.interval ?? 5, 1) * 1000
-  const deadline = Date.now() + (data.expires_in ?? 300) * 1000
+
+  // Clamp expires_in to MAX_DEVICE_CODE_LIFETIME to prevent a malicious AS
+  // from keeping the poll loop alive indefinitely (e.g. expires_in: 999999999).
+  const raw = data.expires_in ?? 300
+  const lifetime = Math.min(Math.max(raw, 0), MAX_DEVICE_CODE_LIFETIME)
+  if (raw > MAX_DEVICE_CODE_LIFETIME) {
+    log.warn("device code expires_in exceeds maximum, clamping", {
+      raw,
+      clamped: MAX_DEVICE_CODE_LIFETIME,
+    })
+  }
+  const deadline = Date.now() + lifetime * 1000
 
   // RFC 8628 §3.2: verification_uri_complete is optional and pre-fills the
   // user code for convenience. However, a malicious AS could set it to a

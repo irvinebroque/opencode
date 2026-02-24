@@ -1,6 +1,6 @@
 /**
  * Per-origin credential store for webfetch.
- * Stores bearer tokens, basic auth, and CF Access service tokens.
+ * Stores bearer tokens and basic auth credentials.
  * File: $XDG_DATA_HOME/opencode/webfetch-auth.json (mode 0o600)
  */
 
@@ -15,15 +15,13 @@ const filepath = path.join(Global.Path.data, "webfetch-auth.json")
 
 export type Credential = {
   resource: string
-  scheme: "bearer" | "basic" | "service-token"
+  scheme: "bearer" | "basic"
   access_token?: string
   refresh_token?: string
   expires_at?: number
   scope?: string
   username?: string
   password?: string
-  client_id?: string
-  client_secret?: string
   oauth_client_id?: string
   oauth_client_secret?: string
   issuer?: string
@@ -131,12 +129,6 @@ export function headers(cred: Credential): Record<string, string> {
     const encoded = btoa(`${cred.username}:${cred.password}`)
     return { Authorization: `Basic ${encoded}` }
   }
-
-  if (cred.scheme === "service-token" && cred.client_id && cred.client_secret)
-    return {
-      "CF-Access-Client-Id": cred.client_id,
-      "CF-Access-Client-Secret": cred.client_secret,
-    }
 
   return {}
 }

@@ -13,7 +13,21 @@ export type Challenge = {
   token68?: string
 }
 
-const TOKEN_CHARS = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/
+// RFC 9110 Section 5.6.2: token character set
+// token = 1*tchar
+// tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+//         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+function isTokenChar(c: number): boolean {
+  if (c >= 0x30 && c <= 0x39) return true // 0-9
+  if (c >= 0x41 && c <= 0x5a) return true // A-Z
+  if (c >= 0x61 && c <= 0x7a) return true // a-z
+  // tchar specials: !#$%&'*+-.^_`|~
+  return c === 0x21 || c === 0x23 || c === 0x24 || c === 0x25 ||
+    c === 0x26 || c === 0x27 || c === 0x2a || c === 0x2b ||
+    c === 0x2d || c === 0x2e || c === 0x5e || c === 0x5f ||
+    c === 0x60 || c === 0x7c || c === 0x7e
+}
+
 const TOKEN68_CHARS = /^[A-Za-z0-9\-._~+/]+=*$/
 
 export function parse(header: string): Challenge[] {
@@ -26,7 +40,7 @@ export function parse(header: string): Challenge[] {
 
   function token(): string {
     const start = pos
-    while (pos < header.length && TOKEN_CHARS.test(header[pos])) pos++
+    while (pos < header.length && isTokenChar(header.charCodeAt(pos))) pos++
     return header.slice(start, pos)
   }
 

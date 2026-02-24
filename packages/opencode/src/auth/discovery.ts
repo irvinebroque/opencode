@@ -152,12 +152,9 @@ function validateResourceSemantics(meta: ResourceMetadata): string | undefined {
   if (!validateResource(meta.resource))
     return "resource must be HTTPS absolute URI without fragment"
 
-  // RFC 9728 §2: bearer_methods_supported values
-  if (meta.bearer_methods_supported) {
-    for (const m of meta.bearer_methods_supported) {
-      if (!BEARER_METHODS.has(m)) return `invalid bearer method: ${m}`
-    }
-  }
+  // RFC 9728 §2: bearer_methods_supported — defined values are "header",
+  // "body", "query" but the list is descriptive, not exhaustive. Future
+  // extensions may add new methods, so unknown values are accepted.
 
   // RFC 9728 §2: resource_signing_alg_values_supported must not include "none"
   if (meta.resource_signing_alg_values_supported?.includes("none"))
@@ -234,11 +231,20 @@ export function asMetadataUrl(issuer: string): string {
 
 /**
  * Fallback: .well-known/openid-configuration (OIDC Discovery 1.0 §4.1).
- * Unlike RFC 8414, OIDC places the well-known path at the origin level.
+ *
+ * OIDC Discovery §4.1: the well-known path is appended to the issuer,
+ * preserving any path component. For example:
+ *   https://example.com          -> https://example.com/.well-known/openid-configuration
+ *   https://example.com/tenant   -> https://example.com/tenant/.well-known/openid-configuration
+ *
+ * This is different from RFC 8414 which inserts the well-known path
+ * between the host and the issuer path.
  */
 function oidcMetadataUrl(issuer: string): string {
   const url = new URL(issuer)
-  return `${url.origin}/.well-known/openid-configuration`
+  let base = url.pathname
+  if (base.endsWith("/")) base = base.slice(0, -1)
+  return `${url.origin}${base}/.well-known/openid-configuration`
 }
 
 // ---------------------------------------------------------------------------
@@ -286,9 +292,12 @@ export async function fetchResourceMetadata(
     return undefined
   }
 
-  // RFC 9728 §3.2: Content-Type must be application/json
+  // RFC 9728 §3.2: Content-Type MUST be application/json.
+  // Only accept application/json (with optional parameters like charset).
+  // Reject loose matches like text/json or application/vnd.api+json.
   const ct = response.headers.get("content-type") ?? ""
-  if (!ct.includes("application/json") && !ct.includes("json")) {
+  const mediaType = ct.split(";")[0]?.trim().toLowerCase() ?? ""
+  if (mediaType !== "application/json") {
     log.info("resource metadata wrong content-type", { url, contentType: ct })
     return undefined
   }
@@ -321,13 +330,12 @@ export async function fetchResourceMetadata(
     return undefined
   }
 
-  // RFC 9728 §3.3: resource value MUST exactly match the expected resource identifier
-  const expected = new URL(resource)
-  const actual = new URL(metadata.resource)
-  // Fragments are not sent to servers, strip for comparison
-  expected.hash = ""
-  if (expected.href !== actual.href) {
-    log.error("resource metadata mismatch", { expected: expected.href, got: actual.href })
+  // RFC 9728 §3.3 + §6: resource value MUST exactly match the expected
+  // resource identifier using code-point-to-code-point comparison.
+  // URL normalization (e.g. https://example.com:443/ vs https://example.com/)
+  // MUST NOT be applied — the comparison is on the original string values.
+  if (metadata.resource !== resource) {
+    log.error("resource metadata mismatch", { expected: resource, got: metadata.resource })
     return undefined
   }
 
@@ -361,9 +369,11 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   const url = asMetadataUrl(issuer)
   log.info("fetching AS metadata", { url })
 
+  // RFC 8414 does NOT prohibit redirects (unlike RFC 9728 for resource metadata).
+  // AS deployments behind load balancers may legitimately redirect. Follow redirects.
   let response = await fetch(url, {
     headers: { Accept: "application/json" },
-    redirect: "error",
+    redirect: "follow",
     signal,
   }).catch(() => undefined)
 
@@ -373,7 +383,7 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     log.info("trying OIDC discovery fallback", { url: fallback })
     response = await fetch(fallback, {
       headers: { Accept: "application/json" },
-      redirect: "error",
+      redirect: "follow",
       signal,
     }).catch(() => undefined)
   }
@@ -383,9 +393,10 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     return undefined
   }
 
-  // Content-Type check
+  // Content-Type check — only accept application/json (with optional parameters)
   const ct = response.headers.get("content-type") ?? ""
-  if (!ct.includes("application/json") && !ct.includes("json")) {
+  const asMediaType = ct.split(";")[0]?.trim().toLowerCase() ?? ""
+  if (asMediaType !== "application/json") {
     log.info("AS metadata wrong content-type", { issuer, contentType: ct })
     return undefined
   }
@@ -423,6 +434,20 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
     return undefined
   }
 
+  // RFC 8414 §2: jwks_uri MUST be HTTPS
+  if (metadata.jwks_uri && !requireHttps(metadata.jwks_uri)) {
+    log.error("AS metadata jwks_uri must be HTTPS", { issuer, value: metadata.jwks_uri })
+    return undefined
+  }
+
+  // RFC 8414 §2: token_endpoint_auth_signing_alg_values_supported MUST NOT
+  // include "none" (it would allow unsigned client assertions).
+  const sigAlgs = obj.token_endpoint_auth_signing_alg_values_supported
+  if (Array.isArray(sigAlgs) && sigAlgs.includes("none")) {
+    log.error("AS metadata token_endpoint_auth_signing_alg_values_supported must not include 'none'", { issuer })
+    return undefined
+  }
+
   // Validate endpoint URLs are HTTPS (or HTTP loopback per RFC 8252 §7.3).
   // A malicious AS metadata document could set these to HTTP URLs, exposing
   // authorization codes, PKCE verifiers, or tokens in cleartext.
@@ -442,6 +467,12 @@ export async function fetchASMetadata(issuer: string, signal?: AbortSignal): Pro
   if (!metadata.grant_types_supported) {
     metadata.grant_types_supported = ["authorization_code", "implicit"]
   }
+
+  // RFC 8414 §2: defaults for optional fields when omitted
+  const asObj = metadata as Record<string, unknown>
+  if (!asObj.response_modes_supported) asObj.response_modes_supported = ["query", "fragment"]
+  if (!asObj.token_endpoint_auth_methods_supported)
+    asObj.token_endpoint_auth_methods_supported = ["client_secret_basic"]
 
   // RFC 8414 §2: authorization_endpoint required when grant types include
   // authorization_code or implicit

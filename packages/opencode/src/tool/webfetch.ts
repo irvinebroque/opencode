@@ -86,13 +86,17 @@ export const WebFetchTool = Tool.define("webfetch", {
           })
         : initial
 
-    // Auth handling: detect 401/403 and attempt RFC 9728/8414 authentication
+    // Auth handling: detect 401/403 and attempt RFC 9728/8414 authentication.
+    // Clear the request timeout before entering the OAuth flow — the interactive
+    // browser authorization may take minutes, and the 30s/120s timeout would
+    // abort the signal mid-flow. The retry fetch uses ctx.abort instead.
     if (!response.ok && (response.status === 401 || response.status === 403)) {
-      const authed = await handleAuth(response, params.url, headers, signal, ctx)
+      clearTimeout()
+      const authed = await handleAuth(response, params.url, headers, ctx.abort, ctx)
       if (authed) response = authed
+    } else {
+      clearTimeout()
     }
-
-    clearTimeout()
 
     if (!response.ok) {
       throw new Error(`Request failed with status code: ${response.status}`)
@@ -184,8 +188,7 @@ export const WebFetchTool = Tool.define("webfetch", {
 })
 
 // ---------------------------------------------------------------------------
-// Auth orchestration — moved here from webfetch-auth.ts to break circular
-// import between webfetch-auth.ts <-> flow.ts.
+// Auth orchestration
 //
 // Flow: 401/403 -> parse WWW-Authenticate (RFC 9110 §11.6.1)
 //       -> discover resource metadata (RFC 9728)
@@ -194,6 +197,20 @@ export const WebFetchTool = Tool.define("webfetch", {
 //       -> OAuth authorization code + PKCE (RFC 7636) or device code (RFC 8628)
 //       -> retry request with credentials
 // ---------------------------------------------------------------------------
+
+function credential(resource: string, tokens: Flow.TokenResult, issuer: string): WebFetchAuth.Credential {
+  return {
+    resource,
+    scheme: "bearer",
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    expires_at: tokens.expires_in ? Date.now() / 1000 + tokens.expires_in : undefined,
+    scope: tokens.scope,
+    oauth_client_id: tokens.client.client_id,
+    oauth_client_secret: tokens.client.client_secret,
+    issuer,
+  }
+}
 
 async function handleAuth(
   response: Response,
@@ -258,13 +275,17 @@ async function handleAuth(
   let cred: WebFetchAuth.Credential | undefined
 
   if (supports.includes("authorization_code") && server.authorization_endpoint) {
-    cred = await Flow.authorizationCode(
+    const tokens = await Flow.authorizationCode(
       url,
       result.resource,
       server,
       client,
       result.resource.scopes_supported,
     )
+    if (tokens) {
+      cred = credential(result.resource.resource, tokens, server.issuer)
+      await WebFetchAuth.set(result.resource.resource, cred)
+    }
   }
 
   // Fallback: Device Authorization Grant — RFC 8628 §3.1
@@ -285,7 +306,11 @@ async function handleAuth(
           uri: device.info.verification_uri,
           code: device.info.user_code,
         })
-        cred = await device.poll()
+        const tokens = await device.poll()
+        if (tokens) {
+          cred = credential(result.resource.resource, tokens, server.issuer)
+          await WebFetchAuth.set(result.resource.resource, cred)
+        }
       }
     }
   }
@@ -335,7 +360,10 @@ async function handleAuth(
     }
   }
 
-  log.error("auth retry failed", { url, status: retry.status })
+  // Remove stale credentials on retry failure so the user isn't stuck
+  // with a bad token on subsequent requests.
+  log.error("auth retry failed, removing stale credential", { url, status: retry.status })
+  await WebFetchAuth.remove(url).catch(() => {})
   return undefined
 }
 

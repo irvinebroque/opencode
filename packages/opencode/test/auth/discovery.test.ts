@@ -155,13 +155,16 @@ describe("fetchResourceMetadata validation", () => {
     expect(result).toBeUndefined()
   })
 
-  test("rejects metadata with invalid bearer_methods_supported values", async () => {
+  test("accepts metadata with unknown bearer_methods_supported values", async () => {
+    // RFC 9728 §2: bearer_methods_supported values are descriptive, not exhaustive.
+    // Unknown values from future extensions must be accepted.
     const url = serve({
       resource: "https://example.com",
-      bearer_methods_supported: ["header", "invalid_method"],
+      bearer_methods_supported: ["header", "future_method"],
     })
     const result = await fetchResourceMetadata(url, "https://example.com")
-    expect(result).toBeUndefined()
+    expect(result).toBeDefined()
+    expect(result!.bearer_methods_supported).toEqual(["header", "future_method"])
   })
 
   test("rejects metadata where resource_signing_alg includes 'none'", async () => {
@@ -243,6 +246,21 @@ describe("fetchResourceMetadata validation", () => {
       `http://127.0.0.1:${resPort}`,
     )
     // redirect: "error" causes fetch to reject → result is undefined
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects resource match with port normalization (RFC 9728 §6 exact match)", async () => {
+    // RFC 9728 §6: comparison is code-point-to-code-point.
+    // https://example.com:443/ and https://example.com/ are different strings.
+    const url = serve({ resource: "https://example.com:443/" })
+    const result = await fetchResourceMetadata(url, "https://example.com/")
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects resource match with trailing slash difference", async () => {
+    // RFC 9728 §6: https://example.com and https://example.com/ are different strings
+    const url = serve({ resource: "https://example.com/" })
+    const result = await fetchResourceMetadata(url, "https://example.com")
     expect(result).toBeUndefined()
   })
 
@@ -532,6 +550,82 @@ describe("fetchASMetadata validation", () => {
     expect(result!.grant_types_supported).toEqual(["implicit"])
   })
 
+  test("rejects AS metadata where jwks_uri is not HTTPS", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            response_types_supported: ["code"],
+            jwks_uri: "http://example.com/jwks.json",
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
+  })
+
+  test("rejects AS metadata with 'none' in token_endpoint_auth_signing_alg_values_supported", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            issuer: `http://127.0.0.1:${port}`,
+            authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+            token_endpoint: `http://127.0.0.1:${port}/token`,
+            response_types_supported: ["code"],
+            token_endpoint_auth_signing_alg_values_supported: ["RS256", "none"],
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeUndefined()
+  })
+
+  test("follows redirects for AS metadata (RFC 8414 does not prohibit them)", async () => {
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/target") {
+          return new Response(
+            JSON.stringify({
+              issuer: `http://127.0.0.1:${port}`,
+              authorization_endpoint: `http://127.0.0.1:${port}/authorize`,
+              token_endpoint: `http://127.0.0.1:${port}/token`,
+              response_types_supported: ["code"],
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        return new Response(null, {
+          status: 302,
+          headers: { Location: `http://127.0.0.1:${port}/target` },
+        })
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
+    expect(result).toBeDefined()
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+  })
+
   test("falls back to OIDC discovery when RFC 8414 endpoint fails", async () => {
     let port = 0
     const s = Bun.serve({
@@ -560,6 +654,39 @@ describe("fetchASMetadata validation", () => {
     const result = await fetchASMetadata(`http://127.0.0.1:${port}`)
     expect(result).toBeDefined()
     expect(result!.issuer).toBe(`http://127.0.0.1:${port}`)
+  })
+
+  test("OIDC fallback with path-bearing issuer preserves path (RFC 8414 §5)", async () => {
+    // OIDC Discovery §4.1: .well-known is appended to the issuer path:
+    //   https://example.com/tenant -> https://example.com/tenant/.well-known/openid-configuration
+    // NOT placed at the origin like: https://example.com/.well-known/openid-configuration
+    let port = 0
+    const s = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const url = new URL(req.url)
+        // RFC 8414 returns 404 for path-bearing issuer
+        if (url.pathname.includes("oauth-authorization-server"))
+          return new Response("Not found", { status: 404 })
+        // OIDC endpoint: must be at /tenant/.well-known/openid-configuration
+        if (url.pathname === "/tenant/.well-known/openid-configuration")
+          return new Response(
+            JSON.stringify({
+              issuer: `http://127.0.0.1:${port}/tenant`,
+              authorization_endpoint: `http://127.0.0.1:${port}/tenant/authorize`,
+              token_endpoint: `http://127.0.0.1:${port}/tenant/token`,
+              response_types_supported: ["code"],
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        return new Response("Not found", { status: 404 })
+      },
+    })
+    port = s.port as number
+    servers.push(s)
+    const result = await fetchASMetadata(`http://127.0.0.1:${port}/tenant`)
+    expect(result).toBeDefined()
+    expect(result!.issuer).toBe(`http://127.0.0.1:${port}/tenant`)
   })
 })
 

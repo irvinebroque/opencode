@@ -4,10 +4,6 @@
  * Stores bearer tokens and basic auth credentials in a JSON file
  * at $XDG_DATA_HOME/opencode/webfetch-auth.json with mode 0o600.
  *
- * This module is a pure credential store with no OAuth flow logic —
- * the orchestration that connects challenges, discovery, and flows
- * lives in webfetch.ts to avoid circular imports.
- *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer tokens)
  * @see https://www.rfc-editor.org/rfc/rfc7617.html (Basic auth)
  */
@@ -83,18 +79,18 @@ export async function get(resource: string): Promise<Credential | undefined> {
   // Origin match
   if (store[origin]) return store[origin]
 
-  // Longest prefix match — path-segment aware to prevent credential leakage.
-  // Without boundary checking, a credential for https://api.example.com/v1
-  // would also match https://api.example.com/v1-malicious-path.
+  // Longest prefix match — origin-aware and path-segment-boundary-aware.
+  // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
+  // 2. Key must end at a path boundary (prevents /v1 matching /v1extra)
   let best: Credential | undefined
   let len = 0
   for (const [key, cred] of Object.entries(store)) {
-    if (resource.startsWith(key) && key.length > len) {
-      const next = resource[key.length]
-      if (!next || next === "/" || next === "?" || next === "#") {
-        best = cred
-        len = key.length
-      }
+    if (key.length <= len || !resource.startsWith(key)) continue
+    if (!URL.canParse(key) || new URL(key).origin !== origin) continue
+    const next = resource[key.length]
+    if (!next || next === "/" || next === "?" || next === "#") {
+      best = cred
+      len = key.length
     }
   }
   return best
@@ -206,6 +202,12 @@ export function headers(cred: Credential): Record<string, string> {
     return { Authorization: `Bearer ${cred.access_token}` }
 
   if (cred.scheme === "basic" && cred.username !== undefined && cred.password !== undefined) {
+    // RFC 7617 §2: user-id MUST NOT contain ":" — it is used as the
+    // separator and would corrupt the credential on the server side.
+    if (cred.username.includes(":")) {
+      log.error("basic auth username must not contain ':'", { resource: cred.resource })
+      return {}
+    }
     // RFC 7617 §2: credentials = user-id ":" password, encoded as base64
     // Use Buffer for proper UTF-8 support (btoa throws on non-ASCII)
     const encoded = Buffer.from(`${cred.username}:${cred.password}`, "utf-8").toString("base64")

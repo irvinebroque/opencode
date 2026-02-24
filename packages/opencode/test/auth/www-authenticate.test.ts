@@ -176,23 +176,48 @@ describe("WWW-Authenticate parser (RFC 9110 §11.6.1)", () => {
 
   test("rejects unterminated quoted-string per RFC 9110 §5.6.4", () => {
     // RFC 9110 §5.6.4: the grammar requires a closing DQUOTE.
-    // The malformed param value is rejected; remaining text may be
-    // misinterpreted as additional challenges (parser recovery behavior).
+    // The unterminated quoted-string must not produce phantom challenges
+    // from the leftover characters inside the broken string.
     const result = parse('Bearer realm="no closing quote')
-    const bearer = result.find((c) => c.scheme === "Bearer")
-    expect(bearer).toBeDefined()
+    expect(result).toHaveLength(1)
+    expect(result[0]!.scheme).toBe("Bearer")
     // realm param must NOT be present — the unterminated quoted-string is rejected
-    expect(bearer!.params["realm"]).toBeUndefined()
+    expect(result[0]!.params["realm"]).toBeUndefined()
   })
 
   test("rejects unterminated quoted-string mid-param-list", () => {
-    // First param parses fine, second has unterminated quote — rejected
+    // First param parses fine, second has unterminated quote — rejected.
+    // Must not produce a second phantom challenge from "unclosed".
     const result = parse('Bearer error=invalid_token, realm="unclosed')
-    const bearer = result.find((c) => c.scheme === "Bearer")
-    expect(bearer).toBeDefined()
-    expect(bearer!.params["error"]).toBe("invalid_token")
+    expect(result).toHaveLength(1)
+    expect(result[0]!.scheme).toBe("Bearer")
+    expect(result[0]!.params["error"]).toBe("invalid_token")
     // realm's unterminated quoted-string is rejected
-    expect(bearer!.params["realm"]).toBeUndefined()
+    expect(result[0]!.params["realm"]).toBeUndefined()
+  })
+
+  // -----------------------------------------------------------------------
+  // RFC 7235 §4.1 canonical examples
+  // -----------------------------------------------------------------------
+
+  test("parses RFC 7235 §4.1 canonical example", () => {
+    const result = parse('Newauth realm="apps", type=1, title="Login to \\"apps\\"", Basic realm="simple"')
+    expect(result).toHaveLength(2)
+    expect(result[0]!.scheme).toBe("Newauth")
+    expect(result[0]!.params["realm"]).toBe("apps")
+    expect(result[0]!.params["type"]).toBe("1")
+    expect(result[0]!.params["title"]).toBe('Login to "apps"')
+    expect(result[1]!.scheme).toBe("Basic")
+    expect(result[1]!.params["realm"]).toBe("simple")
+  })
+
+  test("parses token68 followed by comma and new challenge", () => {
+    const result = parse("Negotiate dGVzdA==, Bearer realm=\"api\"")
+    expect(result).toHaveLength(2)
+    expect(result[0]!.scheme).toBe("Negotiate")
+    expect(result[0]!.token68).toBe("dGVzdA==")
+    expect(result[1]!.scheme).toBe("Bearer")
+    expect(result[1]!.params["realm"]).toBe("api")
   })
 
   // -----------------------------------------------------------------------
@@ -257,6 +282,16 @@ describe("resourceMetadataUrl() — RFC 9728 §5.1", () => {
   test("is case-insensitive on scheme name", () => {
     const challenges = parse(
       'bearer resource_metadata="https://example.com/.well-known/oauth-protected-resource"',
+    )
+    expect(resourceMetadataUrl(challenges)).toBe(
+      "https://example.com/.well-known/oauth-protected-resource",
+    )
+  })
+
+  test("extracts resource_metadata from non-Bearer scheme (e.g. DPoP)", () => {
+    // RFC 9728 §5.1: resource_metadata MAY appear in any scheme
+    const challenges = parse(
+      'DPoP resource_metadata="https://example.com/.well-known/oauth-protected-resource"',
     )
     expect(resourceMetadataUrl(challenges)).toBe(
       "https://example.com/.well-known/oauth-protected-resource",

@@ -53,6 +53,19 @@ function parseToken(input: string, i: number): { value: string; end: number } | 
 }
 
 /**
+ * RFC 9110 §5.6.4: quoted-pair allows only HTAB / SP / VCHAR / obs-text
+ * after the backslash. This excludes NUL, most C0 controls, and DEL.
+ * - HTAB = 0x09
+ * - SP   = 0x20
+ * - VCHAR = 0x21-0x7E
+ * - obs-text = 0x80-0xFF
+ */
+function isQuotedPairChar(c: string): boolean {
+  const code = c.charCodeAt(0)
+  return code === 0x09 || (code >= 0x20 && code !== 0x7f)
+}
+
+/**
  * Parse a quoted-string per RFC 9110 §5.6.4.
  * quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE
  * quoted-pair   = "\" ( HTAB / SP / VCHAR / obs-text )
@@ -65,7 +78,10 @@ function parseQuotedString(input: string, i: number): { value: string; end: numb
     const c = input[i]!
     if (c === '"') return { value: result, end: i + 1 }
     if (c === "\\" && i + 1 < input.length) {
-      result += input[i + 1]
+      const escaped = input[i + 1]!
+      // RFC 9110 §5.6.4: quoted-pair only allows HTAB / SP / VCHAR / obs-text
+      if (!isQuotedPairChar(escaped)) return undefined
+      result += escaped
       i += 2
       continue
     }

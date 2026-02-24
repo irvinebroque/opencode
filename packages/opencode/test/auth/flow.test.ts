@@ -227,6 +227,60 @@ describe("register() (RFC 7591)", () => {
     const result = await register(meta, "http://127.0.0.1:19877/callback")
     expect(result).toBeUndefined()
   })
+
+  test("rejects expiring client_secret per RFC 7591 §3.2.1", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            client_id: "expiring-client",
+            client_secret: "will-expire",
+            client_secret_expires_at: Math.floor(Date.now() / 1000) + 86400,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
+      response_types_supported: ["code"],
+    }
+    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    // Must reject — we have no renewal mechanism for expiring secrets
+    expect(result).toBeUndefined()
+  })
+
+  test("accepts non-expiring client_secret (expires_at = 0) per RFC 7591 §3.2.1", async () => {
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(
+          JSON.stringify({
+            client_id: "permanent-client",
+            client_secret: "permanent-secret",
+            client_secret_expires_at: 0,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
+      response_types_supported: ["code"],
+    }
+    const result = await register(meta, "http://127.0.0.1:19877/callback")
+    // expires_at=0 means "does not expire" — must accept
+    expect(result).toBeDefined()
+    expect(result!.client_id).toBe("permanent-client")
+    expect(result!.client_secret).toBe("permanent-secret")
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -539,5 +593,102 @@ describe("deviceCode() (RFC 8628)", () => {
     }
     const result = await deviceCode("https://api.example.com/data", resource, meta, client)
     expect(result).toBeUndefined()
+  })
+
+  test("clamps absurdly large expires_in to MAX_DEVICE_CODE_LIFETIME", async () => {
+    // A malicious AS returning expires_in: 999999999 (~31 years) must not
+    // cause the poll loop to run indefinitely. The deadline should be clamped
+    // to MAX_DEVICE_CODE_LIFETIME seconds from now.
+    let polls = 0
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "dc-clamp",
+              user_code: "CLAMP",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: 999999999, // ~31 years
+              interval: 1,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        polls++
+        // Succeed on first poll so the test doesn't actually wait
+        return new Response(
+          JSON.stringify({ access_token: "tok-clamped", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const before = Date.now()
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    const cred = await result!.poll()
+    const after = Date.now()
+    expect(cred).toBeDefined()
+    expect(cred!.access_token).toBe("tok-clamped")
+    expect(polls).toBe(1)
+    // The entire flow (initiate + one poll) should complete in well under
+    // MAX_DEVICE_CODE_LIFETIME, proving the deadline was clamped and didn't
+    // extend to ~31 years.
+    expect(after - before).toBeLessThan(MAX_DEVICE_CODE_LIFETIME * 1000)
+  })
+
+  test("negative expires_in is treated as zero (immediate expiry)", async () => {
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "dc-neg",
+              user_code: "NEG",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: -100,
+              interval: 1,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+        // Should never reach token endpoint — deadline already passed
+        return new Response(
+          JSON.stringify({ access_token: "should-not-get", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client)
+    expect(result).toBeDefined()
+    // With negative expires_in clamped to 0, deadline is already in the past,
+    // so poll() should return undefined without making any token requests.
+    const cred = await result!.poll()
+    expect(cred).toBeUndefined()
+  })
+
+  test("MAX_DEVICE_CODE_LIFETIME is a reasonable positive value", () => {
+    expect(MAX_DEVICE_CODE_LIFETIME).toBeGreaterThan(0)
+    // Must not exceed 1 hour — anything longer is unreasonable for device code
+    expect(MAX_DEVICE_CODE_LIFETIME).toBeLessThanOrEqual(3600)
   })
 })

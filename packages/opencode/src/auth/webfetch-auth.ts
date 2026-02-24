@@ -13,6 +13,7 @@
  */
 
 import path from "path"
+import { mkdir } from "fs/promises"
 import { Global } from "../global"
 import { Filesystem } from "../util/filesystem"
 import { Log } from "../util/log"
@@ -21,6 +22,19 @@ import * as Discovery from "./discovery"
 
 const log = Log.create({ service: "webfetch.auth" })
 const filepath = path.join(Global.Path.data, "webfetch-auth.json")
+
+// In-memory mutex to serialize load/modify/save operations and prevent
+// TOCTOU races when concurrent token refreshes or OAuth flows run.
+let lock = Promise.resolve()
+
+function serialized<T>(fn: () => Promise<T>): Promise<T> {
+  const prev = lock
+  let release!: () => void
+  lock = new Promise<void>((r) => {
+    release = r
+  })
+  return prev.then(fn).finally(release)
+}
 
 export type Credential = {
   resource: string
@@ -43,6 +57,9 @@ async function load(): Promise<Store> {
 }
 
 async function save(store: Store) {
+  // Ensure parent directory exists with 0o700 so other users cannot list
+  // the directory contents, even though the file itself is 0o600.
+  await mkdir(path.dirname(filepath), { recursive: true, mode: 0o700 })
   await Filesystem.writeJson(filepath, store, 0o600)
 }
 
@@ -66,13 +83,18 @@ export async function get(resource: string): Promise<Credential | undefined> {
   // Origin match
   if (store[origin]) return store[origin]
 
-  // Longest prefix match
+  // Longest prefix match — path-segment aware to prevent credential leakage.
+  // Without boundary checking, a credential for https://api.example.com/v1
+  // would also match https://api.example.com/v1-malicious-path.
   let best: Credential | undefined
   let len = 0
   for (const [key, cred] of Object.entries(store)) {
     if (resource.startsWith(key) && key.length > len) {
-      best = cred
-      len = key.length
+      const next = resource[key.length]
+      if (!next || next === "/" || next === "?" || next === "#") {
+        best = cred
+        len = key.length
+      }
     }
   }
   return best
@@ -83,11 +105,13 @@ export async function get(resource: string): Promise<Credential | undefined> {
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
  */
-export async function set(resource: string, cred: Credential) {
-  const store = await load()
-  store[resource] = cred
-  await save(store)
-  log.info("stored credential", { resource, scheme: cred.scheme })
+export function set(resource: string, cred: Credential) {
+  return serialized(async () => {
+    const store = await load()
+    store[resource] = cred
+    await save(store)
+    log.info("stored credential", { resource, scheme: cred.scheme })
+  })
 }
 
 /**
@@ -95,11 +119,13 @@ export async function set(resource: string, cred: Credential) {
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html (Bearer Token Usage)
  */
-export async function remove(resource: string) {
-  const store = await load()
-  delete store[resource]
-  await save(store)
-  log.info("removed credential", { resource })
+export function remove(resource: string) {
+  return serialized(async () => {
+    const store = await load()
+    delete store[resource]
+    await save(store)
+    log.info("removed credential", { resource })
+  })
 }
 
 /**

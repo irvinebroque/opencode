@@ -72,8 +72,8 @@ function parseQuotedString(input: string, i: number): { value: string; end: numb
     result += c
     i++
   }
-  // Unterminated quoted-string — return what we have (tolerant parsing)
-  return { value: result, end: i }
+  // RFC 9110 §5.6.4: grammar requires a closing DQUOTE; reject malformed strings
+  return undefined
 }
 
 function parseTokenOrQuoted(input: string, i: number): { value: string; end: number } | undefined {
@@ -91,14 +91,24 @@ function parseToken68(input: string, i: number): { value: string; end: number } 
 
 /**
  * Peek ahead to check if the next content is "token = value" (an auth-param).
- * Used to disambiguate between a new challenge scheme and continuation params.
+ * Used to disambiguate between token68 and auth-params, and between a new
+ * challenge scheme and continuation params.
+ *
+ * Checks for a complete "token BWS = BWS (token | quoted-string)" pattern,
+ * not just "token =", to avoid misclassifying token68 values like "dGVzdA=="
+ * where the trailing "=" is part of base64 padding, not a param separator.
  */
 function isNextParam(input: string, i: number): boolean {
   i = skipOWS(input, i)
   const tok = parseToken(input, i)
   if (!tok) return false
   const afterTok = skipOWS(input, tok.end)
-  return input[afterTok] === "="
+  if (input[afterTok] !== "=") return false
+  // Verify a valid value follows the "="
+  const afterEq = skipOWS(input, afterTok + 1)
+  if (afterEq >= input.length) return false
+  if (input[afterEq] === '"') return true
+  return parseToken(input, afterEq) !== undefined
 }
 
 /**

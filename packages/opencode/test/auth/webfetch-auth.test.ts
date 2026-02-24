@@ -6,9 +6,11 @@
  * - Authorization header generation (Bearer + Basic)
  * - UTF-8 Basic auth encoding (RFC 7617 §2.1)
  * - Token refresh via RFC 6749 §6
+ * - get() lookup: exact, origin, and prefix matching
+ * - resolve() auto-refresh on expired tokens
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { expired, headers, refresh } from "../../src/auth/webfetch-auth"
+import { expired, headers, refresh, get, set, remove, resolve } from "../../src/auth/webfetch-auth"
 import type { Credential } from "../../src/auth/webfetch-auth"
 import type { ASMetadata } from "../../src/auth/discovery"
 
@@ -143,6 +145,122 @@ describe("headers()", () => {
     const result = headers(cred)
     const decoded = Buffer.from(result.Authorization!.replace("Basic ", ""), "base64").toString("utf-8")
     expect(decoded).toBe(":")
+  })
+})
+
+// ---------------------------------------------------------------------------
+// get() — credential lookup with prefix matching
+// ---------------------------------------------------------------------------
+
+describe("get() prefix matching", () => {
+  const keys = [
+    "https://api.example.com/v1",
+    "https://api.example.com/v1/deep",
+    "https://api.example.com",
+  ]
+  afterEach(async () => {
+    for (const k of keys) await remove(k)
+  })
+
+  test("returns exact URL match over prefix match", async () => {
+    const prefix: Credential = {
+      resource: "https://api.example.com/v1",
+      scheme: "bearer",
+      access_token: "prefix-token",
+    }
+    const exact: Credential = {
+      resource: "https://api.example.com/v1/deep",
+      scheme: "bearer",
+      access_token: "exact-token",
+    }
+    await set("https://api.example.com/v1", prefix)
+    await set("https://api.example.com/v1/deep", exact)
+
+    const result = await get("https://api.example.com/v1/deep")
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("exact-token")
+  })
+
+  test("returns origin match when no exact match exists", async () => {
+    const origin: Credential = {
+      resource: "https://api.example.com",
+      scheme: "bearer",
+      access_token: "origin-token",
+    }
+    await set("https://api.example.com", origin)
+
+    const result = await get("https://api.example.com/other/path")
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("origin-token")
+  })
+
+  test("returns longest prefix match", async () => {
+    const short: Credential = {
+      resource: "https://api.example.com/v1",
+      scheme: "bearer",
+      access_token: "short-prefix",
+    }
+    const long: Credential = {
+      resource: "https://api.example.com/v1/deep",
+      scheme: "bearer",
+      access_token: "long-prefix",
+    }
+    await set("https://api.example.com/v1", short)
+    await set("https://api.example.com/v1/deep", long)
+
+    const result = await get("https://api.example.com/v1/deep/nested")
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("long-prefix")
+  })
+
+  test("returns undefined when no match exists", async () => {
+    const result = await get("https://nomatch.example.com/resource")
+    expect(result).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// resolve() — lookup + auto-refresh for expired tokens
+// ---------------------------------------------------------------------------
+
+describe("resolve()", () => {
+  const servers: ReturnType<typeof Bun.serve>[] = []
+  const keys = ["https://resolve-test.example.com"]
+  afterEach(async () => {
+    for (const s of servers) s.stop()
+    servers.length = 0
+    for (const k of keys) await remove(k)
+  })
+
+  test("returns headers for valid non-expired credential", async () => {
+    const cred: Credential = {
+      resource: "https://resolve-test.example.com",
+      scheme: "bearer",
+      access_token: "valid-token",
+      expires_at: Date.now() / 1000 + 3600, // 1 hour from now
+    }
+    await set("https://resolve-test.example.com", cred)
+
+    const result = await resolve("https://resolve-test.example.com")
+    expect(result).toEqual({ Authorization: "Bearer valid-token" })
+  })
+
+  test("returns empty headers for expired credential without refresh_token", async () => {
+    const cred: Credential = {
+      resource: "https://resolve-test.example.com",
+      scheme: "bearer",
+      access_token: "expired-token",
+      expires_at: Date.now() / 1000 - 60, // expired 1 minute ago
+    }
+    await set("https://resolve-test.example.com", cred)
+
+    const result = await resolve("https://resolve-test.example.com")
+    expect(result).toEqual({})
+  })
+
+  test("returns empty headers when no credential exists", async () => {
+    const result = await resolve("https://no-such-credential.example.com")
+    expect(result).toEqual({})
   })
 })
 

@@ -25,11 +25,14 @@ This unblocks webfetch from working with any OAuth-protected API that advertises
 
 ### Related issues
 
+None of these are duplicates — they all target MCP server connections or LLM provider APIs, not the webfetch tool.
+
 | Issue | Relation |
 |-------|----------|
-| #7228 | MCP OAuth fails to follow `authorization_servers` from protected resource metadata. Same RFCs, different integration point (MCP vs webfetch). Closed as completed. |
-| #7135 | OAuth MCP uses wrong path for well-known discovery. Related discovery bug. |
-| #5444 | MCP with OAuth doesn't work. General OAuth failures. |
+| #7228 | MCP OAuth fails to follow `authorization_servers` from protected resource metadata. Same RFCs (9728/8414), different integration point (MCP vs webfetch). Closed as completed. |
+| #9013 | WebFetch User-Agent causes 401 from corporate proxies. Related symptom (webfetch + auth failure), but the ask is a static header override, not an OAuth flow. |
+| #9711 | GitLab OAuth token not auto-refreshed on 401. Same detect-401-and-retry pattern, but for a specific LLM provider, not arbitrary URLs via webfetch. |
+| #6088 | Header-based credential injection for OpenCode's server mode. Related concept (injecting auth), but different scope (server API keys, not webfetch to external sites). |
 
 ### Scope
 

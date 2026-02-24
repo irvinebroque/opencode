@@ -1,9 +1,6 @@
 /**
  * RFC 9728 (Protected Resource Metadata) and RFC 8414 (AS Metadata) discovery.
  *
- * Validates metadata documents with field-level type checking adapted from
- * the audited implementation in irvinebroque/http-rfc-utils.
- *
  * Key RFC compliance points:
  * - RFC 9728 §2: resource identifier MUST be HTTPS, absolute URI, no fragment
  * - RFC 9728 §3.1: well-known URL insertion algorithm
@@ -24,7 +21,7 @@ import { Log } from "../util/log"
 const log = Log.create({ service: "webfetch.discovery" })
 
 // ---------------------------------------------------------------------------
-// Types — adapted from irvinebroque/http-rfc-utils src/types/discovery.ts
+// Types
 // ---------------------------------------------------------------------------
 
 export type ResourceMetadata = {
@@ -233,9 +230,7 @@ function validateIssuer(issuer: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Field-level validation — adapted from irvinebroque/http-rfc-utils
-// src/oauth-protected-resource-metadata.ts and
-// src/oauth-authorization-server-metadata.ts
+// Field-level validation
 // ---------------------------------------------------------------------------
 
 const BEARER_METHODS = new Set(["header", "body", "query"])
@@ -338,8 +333,7 @@ export function resourceMetadataUrl(resource: string): string {
  * Construct the .well-known/oauth-authorization-server URL per RFC 8414 §3.1.
  *
  * Issuer identifiers MUST NOT have query/fragment per RFC 8414 §2.
- * Trailing slashes on the issuer path are normalized (removed) per the
- * reference implementation in irvinebroque/http-rfc-utils.
+ * Trailing slashes on the issuer path are normalized (removed).
  */
 export function asMetadataUrl(issuer: string): string {
   const url = new URL(issuer)

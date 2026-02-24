@@ -2,7 +2,7 @@
  * Tests for WWW-Authenticate header parser.
  *
  * Covers RFC 9110 §11.6.1, RFC 7235 §2.1, and RFC 9728 §5.1.
- * Test cases adapted from the audited irvinebroque/http-rfc-utils test suite.
+
  */
 import { describe, test, expect } from "bun:test"
 import { parse, all, resourceMetadataUrl } from "../../src/auth/www-authenticate"

@@ -4,7 +4,7 @@
  * Tests the well-known URL construction and metadata validation logic.
  * Network-level fetch tests use mock servers via Bun.serve.
  *
- * Test cases adapted from irvinebroque/http-rfc-utils test suite.
+
  */
 import { describe, test, expect, afterEach } from "bun:test"
 import {

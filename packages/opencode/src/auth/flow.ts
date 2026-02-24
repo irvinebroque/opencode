@@ -6,9 +6,6 @@
  * - Device Authorization Grant / RFC 8628 (headless/SSH)
  * - Dynamic Client Registration / RFC 7591
  *
- * PKCE implementation adapted from the audited irvinebroque/http-rfc-utils
- * (src/auth/pkce.ts) which validates per RFC 7636 §4.1-§4.6.
- *
  * Key RFC compliance points:
  * - RFC 7636 §4.1: code_verifier uses unreserved chars, 43-128 characters
  * - RFC 7636 §4.2: S256 challenge = BASE64URL(SHA256(verifier))
@@ -42,8 +39,7 @@ const CALLBACK_TIMEOUT = 5 * 60 * 1000 // 5 minutes
 export const MAX_DEVICE_CODE_LIFETIME = 600
 
 // ---------------------------------------------------------------------------
-// PKCE — adapted from irvinebroque/http-rfc-utils src/auth/pkce.ts
-// RFC 7636 §4.1-§4.2
+// PKCE — RFC 7636 §4.1-§4.2
 // ---------------------------------------------------------------------------
 
 /**
@@ -122,9 +118,12 @@ export async function register(
 
   log.info("attempting dynamic client registration", { endpoint: metadata.registration_endpoint })
 
+  // redirect: "error" prevents a malicious AS from redirecting the POST to an
+  // internal service, which would forward client metadata to the redirect target.
   const response = await fetch(metadata.registration_endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    redirect: "error",
     body: JSON.stringify({
       redirect_uris: [redirectUri],
       client_name: "OpenCode",

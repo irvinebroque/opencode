@@ -7,9 +7,6 @@
  *   auth-param       = token BWS "=" BWS ( token / quoted-string )
  *   token68          = 1*( ALPHA / DIGIT / "-" / "." / "_" / "~" / "+" / "/" ) *"="
  *
- * Parser adapted from the audited implementation in irvinebroque/http-rfc-utils
- * (src/auth/shared.ts) which passes 834+ spec compliance assertions.
- *
  * Key RFC compliance points:
  * - RFC 9110 §5.6.2: token character set (tchar)
  * - RFC 9110 §5.6.4: quoted-string with quoted-pair (backslash escaping)

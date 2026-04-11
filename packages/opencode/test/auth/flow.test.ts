@@ -11,7 +11,16 @@
  * - Device code expires_in validation and clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { pkce, state, register, deviceCode, authorizationCode, LocalCallbackServer, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
+import {
+  pkce,
+  state,
+  register,
+  deviceCode,
+  authorizationCode,
+  LocalCallbackServer,
+  MAX_DEVICE_CODE_LIFETIME,
+  escapeHtml,
+} from "../../src/auth/flow"
 import type { ASMetadata, ResourceMetadata } from "../../src/auth/discovery"
 
 // RFC 7636 §4.1: code_verifier character set
@@ -188,20 +197,9 @@ describe("LocalCallbackServer", () => {
 // ---------------------------------------------------------------------------
 
 describe("HTML escaping in error pages", () => {
-  // Import the module to access escapeHtml indirectly through htmlError
-  // Since escapeHtml is not exported, we test via the public API behavior
-  // The flow.ts module uses escapeHtml in htmlError for error rendering
-
-  test("escapeHtml prevents XSS via script injection", async () => {
-    // The escapeHtml function is internal, but we can verify its behavior
-    // by checking the htmlError output wouldn't execute scripts
+  test("escapeHtml prevents XSS via script injection", () => {
     const malicious = '<script>alert("xss")</script>'
-    const escaped = malicious
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;")
+    const escaped = escapeHtml(malicious)
     expect(escaped).toBe("&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;")
     expect(escaped).not.toContain("<script>")
   })
@@ -209,13 +207,7 @@ describe("HTML escaping in error pages", () => {
   test("escapeHtml handles all dangerous characters", () => {
     const input = `&<>"'`
     const expected = "&amp;&lt;&gt;&quot;&#39;"
-    // Replicate the escapeHtml logic
-    const result = input
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;")
+    const result = escapeHtml(input)
     expect(result).toBe(expected)
   })
 })

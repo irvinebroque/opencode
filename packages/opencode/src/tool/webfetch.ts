@@ -1,5 +1,6 @@
 import z from "zod"
 import { Effect } from "effect"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Tool } from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
@@ -27,6 +28,8 @@ const parameters = z.object({
 export const WebFetchTool = Tool.define(
   "webfetch",
   Effect.gen(function* () {
+    const http = yield* HttpClient.HttpClient
+
     return {
       description: DESCRIPTION,
       parameters,
@@ -72,24 +75,28 @@ export const WebFetchTool = Tool.define(
             Accept: acceptHeader,
             "Accept-Language": "en-US,en;q=0.9",
           }
+          const header = (response: Response | HttpClientResponse.HttpClientResponse, key: string) =>
+            response instanceof Response ? response.headers.get(key) : response.headers[key]
 
           const response = yield* Effect.promise(async () => {
             const timer = abortAfterAny(timeout, ctx.abort)
 
             try {
-              const auth = await resolveCredentials(params.url, store, log, timer.signal)
-              const initial = await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth } })
+              const execute = (headers: Record<string, string>) =>
+                Effect.runPromise(
+                  http.execute(HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))),
+                )
 
-              let response =
-                initial.status === 403 && initial.headers.get("cf-mitigated") === "challenge"
-                  ? await fetch(params.url, {
-                      signal: timer.signal,
-                      headers: { ...headers, ...auth, "User-Agent": "opencode" },
-                    })
+              const auth = await resolveCredentials(params.url, store, log, timer.signal)
+              const initial = await execute({ ...headers, ...auth })
+
+              let response: Response | HttpClientResponse.HttpClientResponse =
+                initial.status === 403 && header(initial, "cf-mitigated") === "challenge"
+                  ? await execute({ ...headers, ...auth, "User-Agent": "opencode" })
                   : initial
 
-              const tryAuth = response.status === 401 || (response.status === 403 && response.headers.has("www-authenticate"))
-              if (!response.ok && tryAuth) {
+              const tryAuth = response.status === 401 || (response.status === 403 && !!header(response, "www-authenticate"))
+              if (!(response.status >= 200 && response.status < 300) && tryAuth) {
                 const interaction: Interaction = {
                   async askConsent(info) {
                     const data: Record<string, string> = {
@@ -105,7 +112,7 @@ export const WebFetchTool = Tool.define(
                     }
                     await Effect.runPromise(
                       ctx.ask({
-                        permission: "webfetch",
+                        permission: "webfetch_auth",
                         patterns: [params.url],
                         always: [params.url],
                         metadata: data,
@@ -135,7 +142,10 @@ export const WebFetchTool = Tool.define(
                 }
 
                 const authed = await handleAuthChallenge({
-                  response,
+                  response:
+                    response instanceof Response
+                      ? response
+                      : new Response(null, { status: response.status, headers: response.headers }),
                   url: params.url,
                   baseHeaders: headers,
                   signal: timer.signal,
@@ -148,7 +158,7 @@ export const WebFetchTool = Tool.define(
                 if (authed) response = authed
               }
 
-              if (!response.ok) {
+              if (!(response.status >= 200 && response.status < 300)) {
                 throw new Error(`Request failed with status code: ${response.status}`)
               }
 
@@ -164,17 +174,19 @@ export const WebFetchTool = Tool.define(
           })
 
           // Check content length
-          const contentLength = response.headers.get("content-length")
+          const contentLength = header(response, "content-length")
           if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
             throw new Error("Response too large (exceeds 5MB limit)")
           }
 
-          const arrayBuffer = yield* Effect.promise(() => response.arrayBuffer())
+          const arrayBuffer = yield* Effect.promise(() =>
+            response instanceof Response ? response.arrayBuffer() : Effect.runPromise(response.arrayBuffer),
+          )
           if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
             throw new Error("Response too large (exceeds 5MB limit)")
           }
 
-          const contentType = response.headers.get("content-type") || ""
+          const contentType = header(response, "content-type") || ""
           const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
           const title = `${params.url} (${contentType})`
 

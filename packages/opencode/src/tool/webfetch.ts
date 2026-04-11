@@ -106,12 +106,7 @@ export const WebFetchTool = Tool.define(
                       url: params.url,
                       action: "authenticate",
                       server: info.server,
-                      scopes: (info.scopes?.join(", ") ?? "default") + " (server-reported, unverified)",
-                    }
-                    if (new URL(params.url).origin !== new URL(info.server).origin) {
-                      data.warning =
-                        `Cross-origin auth: ${new URL(params.url).host} directs authentication to ${new URL(info.server).host}. ` +
-                        `The resulting token will be sent to ${new URL(params.url).host}.`
+                      scopes: info.scopes?.join(", ") ?? "server default",
                     }
                     await Effect.runPromise(
                       ctx.ask({

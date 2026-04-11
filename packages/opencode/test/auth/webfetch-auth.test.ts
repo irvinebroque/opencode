@@ -243,6 +243,24 @@ describe("lookup() prefix matching", () => {
     expect(result!.access_token).toBe("origin-token")
   })
 
+  test("prefers longer prefix match over origin-wide credential", async () => {
+    const mem = new MemoryStore()
+    await mem.set("https://api.example.com", {
+      resource: "https://api.example.com",
+      scheme: "bearer",
+      access_token: "origin-token",
+    })
+    await mem.set("https://api.example.com/v1/private", {
+      resource: "https://api.example.com/v1/private",
+      scheme: "bearer",
+      access_token: "prefix-token",
+    })
+
+    const result = await lookup("https://api.example.com/v1/private/data", mem)
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("prefix-token")
+  })
+
   test("returns longest prefix match", async () => {
     const mem = new MemoryStore()
     await mem.set("https://api.example.com/v1", {
@@ -744,5 +762,39 @@ describe("refresh() (RFC 6749 §6)", () => {
     expect(result).toBeUndefined()
     // The redirect target must never have received the refresh token
     expect(targetHit).toBe(false)
+  })
+
+  test("honors abort signal before refresh request", async () => {
+    const mem = new MemoryStore()
+    let hit = false
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        hit = true
+        return new Response(
+          JSON.stringify({ access_token: "new-token", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const ctrl = new AbortController()
+    ctrl.abort()
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await refresh(cred, meta, mem, undefined, ctrl.signal)
+    expect(result).toBeUndefined()
+    expect(hit).toBe(false)
   })
 })

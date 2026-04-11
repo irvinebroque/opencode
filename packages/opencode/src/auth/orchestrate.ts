@@ -79,137 +79,128 @@ export async function handleAuthChallenge(options: {
     return undefined
   }
 
-  const server = result.servers[0]!
-
-  // Confused deputy detection: warn when the AS origin differs from the
-  // resource origin. A malicious server can return resource metadata
-  // listing a legitimate auth provider, causing the user to authenticate
-  // and then send the resulting token to the malicious server.
-  const resourceOrigin = new URL(options.url).origin
-  const serverOrigin = new URL(server.issuer).origin
-
-  // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials.
-  //    Registration is NOT done here for auth code flow — it is deferred to
-  //    authorizationCode() which registers after the callback server binds,
-  //    ensuring the redirect_uri port matches the actual listening port.
-  let resolved: Flow.ClientInfo | undefined
-
-  // Use pre-configured client_id if available
-  if (options.client?.clientId) {
-    resolved = { client_id: options.client.clientId, client_secret: options.client.clientSecret }
-  }
-
-  // Check store for existing client from previous auth
-  if (!resolved) {
-    const existing = await lookup(options.url, options.store).catch(() => undefined)
-    if (existing?.oauth_client_id) {
-      resolved = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
-    }
-  }
-
-  // 4. Prompt user for consent via Interaction interface
-  await options.interaction.askConsent({
-    resource: options.url,
-    server: server.issuer,
-    scopes: result.resource.scopes_supported,
-  })
-
-  // 5. Execute OAuth flow — RFC 6749 §4.1 (auth code) + RFC 7636 (PKCE)
-  const supports = server.grant_types_supported ?? ["authorization_code"]
-  let cred: Credential | undefined
-
   const registration = options.client ?? { name: "OAuth Client" }
+  let last: Error | undefined
 
-  if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
-    const tokens = await Flow.authorizationCode(
-      options.url,
-      result.resource,
-      server,
-      resolved,
-      result.resource.scopes_supported,
-      {
-        server: options.callbackServer,
-        interaction: options.interaction,
-        registration,
-        logger: log,
-      },
-    )
-    if (tokens) {
-      cred = credential(result.resource.resource, tokens, server.issuer)
-      await options.store.set(result.resource.resource, cred)
+  for (const server of result.servers) {
+    // 3. Client resolution — RFC 7591 §2 (dynamic registration) or stored credentials.
+    //    Registration is NOT done here for auth code flow — it is deferred to
+    //    authorizationCode() which registers after the callback server binds,
+    //    ensuring the redirect_uri port matches the actual listening port.
+    let resolved: Flow.ClientInfo | undefined
+
+    if (options.client?.clientId) {
+      resolved = { client_id: options.client.clientId, client_secret: options.client.clientSecret }
     }
-  }
 
-  // Fallback: Device Authorization Grant — RFC 8628 §3.1
-  if (
-    !cred &&
-    supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
-    server.device_authorization_endpoint
-  ) {
-    // Register for device code if no client yet.
-    // If a CallbackServer is provided, start it to get a redirect_uri for
-    // registration, then stop it (device code doesn't use the callback server
-    // itself, but the redirect URI is needed for the registration request).
-    if (!resolved && server.registration_endpoint) {
-      if (options.callbackServer) {
-        try {
-          const { redirectUri } = await options.callbackServer.start()
-          resolved = (await Flow.register(server, redirectUri, registration, log)) ?? undefined
-          await options.callbackServer.stop()
-        } catch {
-          // If callback server fails, can't register
-        }
+    if (!resolved) {
+      const existing = await lookup(options.url, options.store).catch(() => undefined)
+      if (existing?.oauth_client_id && (!existing.issuer || existing.issuer === server.issuer)) {
+        resolved = { client_id: existing.oauth_client_id, client_secret: existing.oauth_client_secret }
       }
     }
-    if (resolved) {
-      const device = await Flow.deviceCode(
+
+    await options.interaction.askConsent({
+      resource: options.url,
+      server: server.issuer,
+      scopes: result.resource.scopes_supported,
+    })
+
+    const supports = server.grant_types_supported ?? ["authorization_code"]
+    let cred: Credential | undefined
+
+    if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
+      const tokens = await Flow.authorizationCode(
         options.url,
         result.resource,
         server,
         resolved,
         result.resource.scopes_supported,
-        log,
+        {
+          server: options.callbackServer,
+          interaction: options.interaction,
+          registration,
+          logger: log,
+          signal: options.signal,
+        },
       )
-      if (device) {
-        await options.interaction.showDeviceCode(device.info)
-        const tokens = await device.poll()
-        if (tokens) {
-          cred = credential(result.resource.resource, tokens, server.issuer)
-          await options.store.set(result.resource.resource, cred)
+      if (tokens) {
+        cred = credential(result.resource.resource, tokens, server.issuer)
+        await options.store.set(result.resource.resource, cred)
+      }
+    }
+
+    if (
+      !cred &&
+      supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
+      server.device_authorization_endpoint
+    ) {
+      if (!resolved && server.registration_endpoint && options.callbackServer) {
+        try {
+          const { redirectUri } = await options.callbackServer.start()
+          resolved = (await Flow.register(server, redirectUri, registration, log, options.signal)) ?? undefined
+          await options.callbackServer.stop()
+        } catch {
+          // If callback server fails, can't register
+        }
+      }
+      if (resolved) {
+        const device = await Flow.deviceCode(
+          options.url,
+          result.resource,
+          server,
+          resolved,
+          result.resource.scopes_supported,
+          log,
+          options.signal,
+        )
+        if (device) {
+          await options.interaction.showDeviceCode(device.info)
+          const tokens = await device.poll()
+          if (tokens) {
+            cred = credential(result.resource.resource, tokens, server.issuer)
+            await options.store.set(result.resource.resource, cred)
+          }
         }
       }
     }
-  }
 
-  if (!cred) {
-    if (!resolved) {
-      const docs = server.service_documentation ?? server.issuer
-      throw new Error(
-        `This URL requires OAuth authentication via ${server.issuer}, ` +
-          `but no client_id is configured and dynamic registration is not available. ` +
-          `Register a client at ${docs} and configure a client_id.`,
-      )
+    if (!cred) {
+      if (!resolved) {
+        const docs = server.service_documentation ?? server.issuer
+        last = new Error(
+          `This URL requires OAuth authentication via ${server.issuer}, ` +
+            `but no client_id is configured and dynamic registration is not available. ` +
+            `Register a client at ${docs} and configure a client_id.`,
+        )
+        continue
+      }
+      last = new Error(`OAuth authentication failed for ${options.url} via ${server.issuer}. Please try again.`)
+      continue
     }
-    throw new Error(`OAuth authentication failed for ${options.url}. Please try again.`)
+
+    // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
+    // redirect: "error" prevents the Bearer token from being forwarded to a
+    // redirect target, potentially on a different origin. If the server
+    // returns a 3xx, the token must not leak to the redirect destination.
+    const auth = headers(cred, log)
+    const retry = await fetch(options.url, {
+      signal: options.signal,
+      redirect: "error",
+      headers: { ...options.baseHeaders, ...auth },
+    }).catch(() => undefined)
+
+    if (retry?.ok) return retry
+
+    log.error("auth retry failed, removing stale credential", {
+      url: options.url,
+      issuer: server.issuer,
+      status: retry?.status,
+    })
+    await options.store.remove(result.resource.resource).catch(() => {})
+    last = new Error(`OAuth authentication succeeded but retry failed for ${options.url} via ${server.issuer}.`)
   }
 
-  // 6. Retry with credentials — RFC 6750 §2.1 (Bearer in Authorization header)
-  // redirect: "error" prevents the Bearer token from being forwarded to a
-  // redirect target, potentially on a different origin. If the server
-  // returns a 3xx, the token must not leak to the redirect destination.
-  const auth = headers(cred, log)
-  const retry = await fetch(options.url, {
-    signal: options.signal,
-    redirect: "error",
-    headers: { ...options.baseHeaders, ...auth },
-  }).catch(() => undefined)
-
-  if (retry?.ok) return retry
-
-  // Remove stale credentials on retry failure so the user isn't stuck
-  // with a bad token on subsequent requests. Use the canonical resource
-  // identifier (same key used by set()) — not the original request URL.
-  log.error("auth retry failed, removing stale credential", { url: options.url, status: retry?.status })
-  await options.store.remove(result.resource.resource).catch(() => {})
+  if (last) throw last
   return undefined
 }

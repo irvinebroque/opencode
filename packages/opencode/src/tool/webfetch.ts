@@ -77,7 +77,7 @@ export const WebFetchTool = Tool.define(
               }
 
               // Layer 1: resolve stored credentials (local lookup, auto-refresh)
-              const auth = await resolveCredentials(params.url, store, log)
+              const auth = await resolveCredentials(params.url, store, log, timer.signal)
 
               const initial = await fetch(params.url, { signal: timer.signal, headers: { ...headers, ...auth } })
 
@@ -115,8 +115,18 @@ export const WebFetchTool = Tool.define(
                   async openUrl(url) {
                     await (await import("open")).default(url)
                   },
-                  // TODO: integrate device code display into TUI so the user sees the code.
                   async showDeviceCode(info) {
+                    await Effect.runPromise(
+                      ctx.metadata({
+                        title: "Authenticate webfetch request",
+                        metadata: {
+                          url: params.url,
+                          action: "device_code",
+                          verification_uri: info.verification_uri,
+                          user_code: info.user_code,
+                        },
+                      }),
+                    )
                     log.info("device code flow", {
                       uri: info.verification_uri,
                       code: info.user_code,

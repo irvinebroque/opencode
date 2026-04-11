@@ -53,8 +53,8 @@ export type Credential = {
  *
  * Matching priority:
  * 1. Exact URL match
- * 2. Origin match
- * 3. Longest prefix match (path-segment-boundary-aware)
+ * 2. Longest prefix match (path-segment-boundary-aware)
+ * 3. Origin match
  *
  * @see https://www.rfc-editor.org/rfc/rfc6750.html#section-3 (scope of protection)
  */
@@ -64,9 +64,6 @@ export async function lookup(resource: string, store: CredentialStore): Promise<
 
   // Exact match first
   if (all[resource]) return all[resource]
-
-  // Origin match
-  if (all[origin]) return all[origin]
 
   // Longest prefix match — origin-aware and path-segment-boundary-aware.
   // 1. Origins must match (prevents https://a.com matching https://a.com.evil.com)
@@ -82,7 +79,10 @@ export async function lookup(resource: string, store: CredentialStore): Promise<
       len = key.length
     }
   }
-  return best
+  if (best) return best
+
+  // Origin match is the broadest fallback.
+  return all[origin]
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +155,7 @@ export async function refresh(
   metadata: ASMetadata,
   store: CredentialStore,
   logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
+  signal?: AbortSignal,
 ): Promise<Credential | undefined> {
   if (!cred.refresh_token || !metadata.token_endpoint) return undefined
   if (!requireHttps(metadata.token_endpoint)) return undefined
@@ -178,6 +179,7 @@ export async function refresh(
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     redirect: "error",
+    signal,
     body: body.toString(),
   }).catch(() => undefined)
 
@@ -230,6 +232,7 @@ export async function resolveCredentials(
   url: string,
   store: CredentialStore,
   logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
+  signal?: AbortSignal,
 ): Promise<Record<string, string>> {
   const cred = await lookup(url, store).catch(() => undefined)
   if (!cred) return {}
@@ -249,9 +252,9 @@ export async function resolveCredentials(
       return {}
     }
 
-    const as = await fetchASMetadata(cred.issuer, undefined, { logger })
+    const as = await fetchASMetadata(cred.issuer, signal, { logger })
     if (as) {
-      const refreshed = await refresh(cred, as, store, logger)
+      const refreshed = await refresh(cred, as, store, logger, signal)
       if (refreshed) return headers(refreshed, logger)
     }
   }

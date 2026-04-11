@@ -73,6 +73,23 @@ export interface ClientRegistration {
   clientSecret?: string
 }
 
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms))
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal.removeEventListener("abort", abort)
+      resolve()
+    }, ms)
+    const abort = () => {
+      clearTimeout(timeout)
+      signal.removeEventListener("abort", abort)
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", abort, { once: true })
+  })
+}
+
 // ---------------------------------------------------------------------------
 // LocalCallbackServer — default CallbackServer using node:http
 // ---------------------------------------------------------------------------
@@ -330,6 +347,7 @@ export async function register(
   redirectUri: string,
   registration: ClientRegistration,
   logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
+  signal?: AbortSignal,
 ): Promise<ClientInfo | undefined> {
   if (!metadata.registration_endpoint) return undefined
 
@@ -347,6 +365,7 @@ export async function register(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     redirect: "error",
+    signal,
     body: JSON.stringify({
       redirect_uris: [redirectUri],
       client_name: registration.name,
@@ -437,6 +456,7 @@ export async function authorizationCode(
     interaction: Interaction
     registration: ClientRegistration
     logger?: Log.Logger
+    signal?: AbortSignal
   },
 ): Promise<TokenResult | undefined> {
   const log = opts.logger ?? Log.create({ service: "webfetch-auth" })
@@ -475,7 +495,7 @@ export async function authorizationCode(
 
   // Deferred registration: register with the actual redirect URI
   if (!resolved && asMeta.registration_endpoint) {
-    resolved = (await register(asMeta, redirectUri, opts.registration, log)) ?? undefined
+    resolved = (await register(asMeta, redirectUri, opts.registration, log, opts.signal)) ?? undefined
   }
   if (!resolved) {
     log.error("no client available for authorization code flow")
@@ -508,7 +528,13 @@ export async function authorizationCode(
   }
 
   // Open URL via the Interaction interface — consumer decides how
-  await opts.interaction.openUrl(authUrl)
+  try {
+    await opts.interaction.openUrl(authUrl)
+  } catch (err) {
+    log.error("failed to open authorization URL", { error: String(err) })
+    await opts.server.stop()
+    return undefined
+  }
 
   // Log only the host — the full URL contains the state parameter and
   // code_challenge which, while not secret, could be exploited by an
@@ -543,6 +569,7 @@ export async function authorizationCode(
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     redirect: "error",
+    signal: opts.signal,
     body: body.toString(),
   }).catch(() => undefined)
 
@@ -608,6 +635,7 @@ export async function deviceCode(
   client: ClientInfo,
   scopes?: string[],
   logger?: Log.Logger,
+  signal?: AbortSignal,
 ): Promise<{ info: DeviceInfo; poll: () => Promise<TokenResult | undefined> } | undefined> {
   const log = logger ?? Log.create({ service: "webfetch-auth" })
 
@@ -639,6 +667,7 @@ export async function deviceCode(
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     redirect: "error",
+    signal,
     body: body.toString(),
   }).catch(() => undefined)
 
@@ -709,7 +738,8 @@ export async function deviceCode(
 
   async function poll(): Promise<TokenResult | undefined> {
     while (Date.now() < deadline) {
-      await new Promise<void>((r) => setTimeout(r, interval))
+      await sleep(interval, signal).catch(() => undefined)
+      if (signal?.aborted) return undefined
 
       const body = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
@@ -724,6 +754,7 @@ export async function deviceCode(
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         redirect: "error",
+        signal,
         body: body.toString(),
       }).catch(() => undefined)
 

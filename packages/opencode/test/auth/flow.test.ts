@@ -11,7 +11,7 @@
  * - Device code expires_in validation and clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { pkce, state, register, deviceCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
+import { pkce, state, register, deviceCode, authorizationCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
 import type { ASMetadata, ResourceMetadata } from "../../src/auth/discovery"
 
 // RFC 7636 §4.1: code_verifier character set
@@ -280,6 +280,85 @@ describe("register() (RFC 7591)", () => {
     expect(result).toBeDefined()
     expect(result!.client_id).toBe("permanent-client")
     expect(result!.client_secret).toBe("permanent-secret")
+  })
+
+  test("honors abort signal before registration request", async () => {
+    let hit = false
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        hit = true
+        return new Response(
+          JSON.stringify({ client_id: "test-client-id" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const ctrl = new AbortController()
+    ctrl.abort()
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      registration_endpoint: `http://127.0.0.1:${s.port as number}/register`,
+      response_types_supported: ["code"],
+    }
+    const result = await register(
+      meta,
+      "http://127.0.0.1:19877/callback",
+      { name: "OpenCode", uri: "https://opencode.ai" },
+      undefined,
+      ctrl.signal,
+    )
+    expect(result).toBeUndefined()
+    expect(hit).toBe(false)
+  })
+})
+
+describe("authorizationCode()", () => {
+  test("stops callback server when opening the browser fails", async () => {
+    let waitCalled = false
+    let stopCalled = 0
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: "https://as.example.com/authorize",
+        token_endpoint: "https://as.example.com/token",
+        response_types_supported: ["code"],
+      },
+      { client_id: "test-client" },
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            waitCalled = true
+            return "code"
+          },
+          async stop() {
+            stopCalled++
+          },
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl() {
+            throw new Error("cannot open browser")
+          },
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode" },
+      },
+    )
+
+    expect(result).toBeUndefined()
+    expect(waitCalled).toBe(false)
+    expect(stopCalled).toBe(1)
   })
 })
 
@@ -719,6 +798,39 @@ describe("deviceCode() (RFC 8628)", () => {
     expect(MAX_DEVICE_CODE_LIFETIME).toBeGreaterThan(0)
     // Must not exceed 1 hour — anything longer is unreasonable for device code
     expect(MAX_DEVICE_CODE_LIFETIME).toBeLessThanOrEqual(3600)
+  })
+
+  test("honors abort signal before device authorization request", async () => {
+    let hit = false
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        hit = true
+        return new Response(
+          JSON.stringify({
+            device_code: "test-device-code",
+            user_code: "ABCD-1234",
+            verification_uri: "https://as.example.com/verify",
+            expires_in: 300,
+          }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const ctrl = new AbortController()
+    ctrl.abort()
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, client, undefined, undefined, ctrl.signal)
+    expect(result).toBeUndefined()
+    expect(hit).toBe(false)
   })
 })
 

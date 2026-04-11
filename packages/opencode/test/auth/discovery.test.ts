@@ -259,10 +259,16 @@ describe("fetchResourceMetadata validation", () => {
     expect(result).toBeUndefined()
   })
 
-  test("rejects resource match with trailing slash difference", async () => {
-    // RFC 9728 §6: https://example.com and https://example.com/ are different strings
+  test("accepts root resource match with trailing slash difference", async () => {
     const url = serve({ resource: "https://example.com/" })
     const result = await fetchResourceMetadata(url, "https://example.com")
+    expect(result).toBeDefined()
+    expect(result!.resource).toBe("https://example.com/")
+  })
+
+  test("rejects path resource match with trailing slash difference", async () => {
+    const url = serve({ resource: "https://example.com/foo/" })
+    const result = await fetchResourceMetadata(url, "https://example.com/foo")
     expect(result).toBeUndefined()
   })
 

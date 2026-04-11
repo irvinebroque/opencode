@@ -463,6 +463,14 @@ function oidcMetadataUrl(issuer: string): string {
 /** Maximum metadata response size (1 MiB). Prevents OOM from malicious servers. */
 const MAX_METADATA_BYTES = 1_048_576
 
+function root(value: string) {
+  try {
+    const url = new URL(value)
+    if (url.username || url.password || url.search || url.hash || url.pathname !== "/") return
+    if (value === url.origin || value === `${url.origin}/`) return `${url.origin}/`
+  } catch {}
+}
+
 /**
  * Read response body as JSON, enforcing a byte size limit.
  * Prevents OOM from malicious servers returning multi-gigabyte responses.
@@ -588,11 +596,11 @@ export async function fetchResourceMetadata(
     return undefined
   }
 
-  // RFC 9728 §3.3 + §6: resource value MUST exactly match the expected
-  // resource identifier using code-point-to-code-point comparison.
-  // URL normalization (e.g. https://example.com:443/ vs https://example.com/)
-  // MUST NOT be applied — the comparison is on the original string values.
-  if (metadata.resource !== resource) {
+  // RFC 9728 requires exact matching. The one tolerated variant here is the
+  // bare origin written as either https://example.com or https://example.com/.
+  const a = root(metadata.resource)
+  const b = root(resource)
+  if (metadata.resource !== resource && (!a || a !== b)) {
     log.error("resource metadata mismatch", { expected: resource, got: metadata.resource })
     return undefined
   }

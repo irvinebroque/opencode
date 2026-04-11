@@ -18,12 +18,6 @@ const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
 const AUTH_TIMEOUT = MAX_DEVICE_CODE_LIFETIME * 1000 // 10 minutes
 
-function browser() {
-  if (process.env["SSH_CONNECTION"] || process.env["SSH_TTY"] || process.env["CI"]) return false
-  if (process.platform === "linux" && !process.env["DISPLAY"] && !process.env["WAYLAND_DISPLAY"]) return false
-  return true
-}
-
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
   format: z
@@ -98,7 +92,7 @@ export const WebFetchTool = Tool.define(
 
               const cred = await resolveCredentials(params.url, store, log, timer.signal)
               const initial = await execute({ ...headers, ...cred })
-              const device = !browser()
+              const device = ctx.extra?.headless === true
 
               let response: Response | HttpClientResponse.HttpClientResponse =
                 initial.status === 403 && header(initial, "cf-mitigated") === "challenge"
@@ -126,9 +120,6 @@ export const WebFetchTool = Tool.define(
                     )
                   },
                   async openUrl(url) {
-                    if (device) {
-                      throw new Error("This environment does not support browser sign-in. Device authorization is required.")
-                    }
                     await (await import("open")).default(url)
                   },
                   async showDeviceCode(info) {

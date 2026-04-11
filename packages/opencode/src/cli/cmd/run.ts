@@ -709,6 +709,7 @@ export const RunCommand = cmd({
           command: args.command,
           arguments: message,
           variant: args.variant,
+          headless: true,
         })
       } else {
         const model = args.model ? Provider.parseModel(args.model) : undefined
@@ -717,6 +718,7 @@ export const RunCommand = cmd({
           agent,
           model,
           variant: args.variant,
+          headless: true,
           parts: [...files, { type: "text", text: message }],
         })
       }

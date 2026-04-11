@@ -14,7 +14,9 @@ When `webfetch` gets a 401 or 403 response, the orchestration layer in `orchestr
 
 4. **Execute the OAuth flow** (`flow.ts`):
    - **Authorization Code + PKCE** ([RFC 6749 &sect;4.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1) + [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html)): Starts a local HTTP callback server on `127.0.0.1:19877` (with port fallback), delegates browser opening to the caller via the `Interaction` interface, waits for the callback with an authorization code, then exchanges the code (with PKCE verifier) for tokens.
-   - **Device Authorization Grant** ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html)): For headless/SSH environments. Returns a `user_code` and `verification_uri` for the caller to display via the `Interaction` interface, then polls the token endpoint until authorization completes.
+   - **Device Authorization Grant** ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html)): Returns a `user_code` and `verification_uri` for the caller to display via the `Interaction` interface, then polls the token endpoint until authorization completes. OpenCode now uses this in two cases: explicit headless mode (for example `opencode run`) or as a fallback when browser launch fails and the AS supports device authorization.
+
+By default, OpenCode is browser-first: if the AS supports authorization code flow, the orchestrator tries that first and only falls back to device code when needed. Headless behavior is not inferred from environment variables inside the auth module; instead, callers can explicitly request device-first behavior via `preferDevice`. The CLI `run` command uses that explicit path.
 
 5. **Store the credential** (`webfetch-auth.ts`) and retry the original request with the `Authorization: Bearer` header. The authenticated retry uses `redirect: "error"` so bearer tokens are not forwarded to redirect targets.
 
@@ -68,7 +70,7 @@ sequenceDiagram
         OC->>OC: Validate state parameter (CSRF check)
         OC->>AS: POST token_endpoint<br/>(grant_type=authorization_code, code, code_verifier)
         AS-->>OC: { access_token, refresh_token, expires_in }
-    else Device Authorization Grant (headless / SSH)
+    else Device Authorization Grant (explicit headless mode or browser-open fallback)
         opt No client_id available
             OC->>AS: POST registration_endpoint (RFC 7591)
             AS-->>OC: { client_id }
@@ -110,7 +112,7 @@ Executes OAuth flows:
 
 - **Authorization Code + PKCE**: Accepts a `CallbackServer` and `Interaction` interface from the caller, generates PKCE `code_verifier` + `S256` `code_challenge` per [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html), delegates browser opening to the `Interaction` interface, waits for the callback, validates the `state` parameter (CSRF protection), and exchanges the authorization code for tokens. Client registration ([RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html)) is deferred until after the server binds so the `redirect_uri` port matches. A default `LocalCallbackServer` implementation using `node:http` is provided, starting on `127.0.0.1:19877` with port fallback.
 
-- **Device Authorization Grant**: For headless/SSH environments per [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html). Initiates the device authorization request, returns a `user_code` + `verification_uri` for the caller to display via the `Interaction` interface, and polls the token endpoint with `slow_down` backoff. Device code `expires_in` is clamped to 10 minutes to prevent a malicious AS from keeping the poll loop alive indefinitely.
+- **Device Authorization Grant**: Implements [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html). Initiates the device authorization request, returns a `user_code` + `verification_uri` for the caller to display via the `Interaction` interface, and polls the token endpoint with `slow_down` backoff. Device code `expires_in` is clamped to 10 minutes to prevent a malicious AS from keeping the poll loop alive indefinitely. The flow itself is transport-neutral; the caller decides whether to prefer it up front, and the orchestrator can also fall back to it after a browser-launch failure.
 
 - **Dynamic Client Registration**: Registers OpenCode as an OAuth client per [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html) when no `client_id` is configured.
 
@@ -120,7 +122,7 @@ Credential types, matching logic, pure functions, and file-backed store for the 
 
 ### `orchestrate.ts`
 
-Auth orchestration — Layer 2. Ties together: challenge parsing (`www-authenticate.ts`), metadata discovery (`discovery.ts`), user consent prompt via the `Interaction` interface, client resolution (stored credentials or dynamic registration), flow selection (auth code vs. device code via `flow.ts`), credential storage, Basic-auth fallback messaging, and retry with credentials. Accepts a pluggable `CredentialStore`, `CallbackServer`, and `Interaction` to keep the orchestration logic decoupled from opencode-specific concerns.
+Auth orchestration — Layer 2. Ties together: challenge parsing (`www-authenticate.ts`), metadata discovery (`discovery.ts`), user consent prompt via the `Interaction` interface, client resolution (stored credentials or dynamic registration), flow selection (browser-first by default, explicit device-first when `preferDevice` is set, and device fallback after browser-open failure), credential storage, Basic-auth fallback messaging, and retry with credentials. Accepts a pluggable `CredentialStore`, `CallbackServer`, and `Interaction` to keep the orchestration logic decoupled from opencode-specific concerns.
 
 ### `index.ts`
 

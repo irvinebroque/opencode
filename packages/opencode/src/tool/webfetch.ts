@@ -8,13 +8,14 @@ import { abortAfterAny } from "../util/abort"
 import { Log } from "../util/log"
 import { store, resolveCredentials } from "../auth/webfetch-auth"
 import { handleAuthChallenge } from "../auth/orchestrate"
-import { LocalCallbackServer, type Interaction } from "../auth/flow"
+import { LocalCallbackServer, MAX_DEVICE_CODE_LIFETIME, type Interaction } from "../auth/flow"
 
 const log = Log.create({ service: "webfetch" })
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
+const AUTH_TIMEOUT = MAX_DEVICE_CODE_LIFETIME * 1000 // 10 minutes
 
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
@@ -80,6 +81,7 @@ export const WebFetchTool = Tool.define(
 
           const response = yield* Effect.promise(async () => {
             const timer = abortAfterAny(timeout, ctx.abort)
+            let auth: ReturnType<typeof abortAfterAny> | undefined
 
             try {
               const execute = (headers: Record<string, string>) =>
@@ -87,16 +89,17 @@ export const WebFetchTool = Tool.define(
                   http.execute(HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))),
                 )
 
-              const auth = await resolveCredentials(params.url, store, log, timer.signal)
-              const initial = await execute({ ...headers, ...auth })
+              const cred = await resolveCredentials(params.url, store, log, timer.signal)
+              const initial = await execute({ ...headers, ...cred })
 
               let response: Response | HttpClientResponse.HttpClientResponse =
                 initial.status === 403 && header(initial, "cf-mitigated") === "challenge"
-                  ? await execute({ ...headers, ...auth, "User-Agent": "opencode" })
+                  ? await execute({ ...headers, ...cred, "User-Agent": "opencode" })
                   : initial
 
               const tryAuth = response.status === 401 || (response.status === 403 && !!header(response, "www-authenticate"))
               if (!(response.status >= 200 && response.status < 300) && tryAuth) {
+                auth = abortAfterAny(AUTH_TIMEOUT, ctx.abort)
                 const interaction: Interaction = {
                   async askConsent(info) {
                     const data: Record<string, string> = {
@@ -148,7 +151,7 @@ export const WebFetchTool = Tool.define(
                       : new Response(null, { status: response.status, headers: response.headers }),
                   url: params.url,
                   baseHeaders: headers,
-                  signal: timer.signal,
+                  signal: auth.signal,
                   store,
                   interaction,
                   callbackServer: new LocalCallbackServer(),
@@ -164,11 +167,12 @@ export const WebFetchTool = Tool.define(
 
               return response
             } catch (err) {
-              if (timer.signal.aborted && !ctx.abort.aborted) {
+              if ((timer.signal.aborted || auth?.signal.aborted) && !ctx.abort.aborted) {
                 throw new Error("Request timed out")
               }
               throw err
             } finally {
+              auth?.clearTimeout()
               timer.clearTimeout()
             }
           })

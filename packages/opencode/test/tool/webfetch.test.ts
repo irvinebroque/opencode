@@ -3,8 +3,8 @@ import path from "path"
 import { Effect } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { Instance } from "../../src/project/instance"
-import { SessionID, MessageID } from "../../src/session/schema"
 import { WebFetchTool } from "../../src/tool/webfetch"
+import { SessionID, MessageID } from "../../src/session/schema"
 
 const projectRoot = path.join(import.meta.dir, "../..")
 

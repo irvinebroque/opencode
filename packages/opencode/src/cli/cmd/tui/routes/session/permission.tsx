@@ -338,7 +338,7 @@ export function PermissionPrompt(props: { request: PermissionRequest }) {
               const scopes = typeof meta.scopes === "string" ? meta.scopes : ""
               return {
                 icon: "%",
-                title: "Authenticate webfetch request",
+                title: "Sign in to access this URL",
                 body: (
                   <box paddingLeft={1} gap={1} flexDirection="column">
                     <Show when={url}>

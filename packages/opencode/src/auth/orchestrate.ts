@@ -52,6 +52,7 @@ export async function handleAuthChallenge(options: {
   callbackServer?: CallbackServer
   client?: ClientRegistration
   logger?: Log.Logger
+  preferDevice?: boolean
 }): Promise<Response | undefined> {
   const log = options.logger ?? Log.create({ service: "webfetch-auth" })
   log.info("auth required", { url: options.url, status: options.response.status })
@@ -107,11 +108,20 @@ export async function handleAuthChallenge(options: {
     })
 
     const supports = server.grant_types_supported ?? ["authorization_code"]
+    const device = supports.includes("urn:ietf:params:oauth:grant-type:device_code") && !!server.device_authorization_endpoint
     const canRegister = !!server.registration_endpoint && !!options.callbackServer
     let cred: Credential | undefined
     let authError: Error | undefined
 
-    if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
+    if (options.preferDevice && !device) {
+      last = new Error(
+        `This URL requires browser-based OAuth via ${server.issuer}, ` +
+          `but this environment only supports device authorization.`,
+      )
+      continue
+    }
+
+    if (!options.preferDevice && supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
       const tokens = await Flow.authorizationCode(
         options.url,
         result.resource,
@@ -135,11 +145,7 @@ export async function handleAuthChallenge(options: {
       }
     }
 
-    if (
-      !cred &&
-      supports.includes("urn:ietf:params:oauth:grant-type:device_code") &&
-      server.device_authorization_endpoint
-    ) {
+    if (!cred && device) {
       if (!resolved && server.registration_endpoint && options.callbackServer) {
         try {
           const { redirectUri } = await options.callbackServer.start()

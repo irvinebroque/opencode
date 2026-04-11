@@ -11,11 +11,18 @@ import { handleAuthChallenge } from "../auth/orchestrate"
 import { LocalCallbackServer, MAX_DEVICE_CODE_LIFETIME, type Interaction } from "../auth/flow"
 
 const log = Log.create({ service: "webfetch" })
+const SIGN_IN_TITLE = "Sign in to access this URL"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
 const AUTH_TIMEOUT = MAX_DEVICE_CODE_LIFETIME * 1000 // 10 minutes
+
+function browser() {
+  if (process.env["SSH_CONNECTION"] || process.env["SSH_TTY"] || process.env["CI"]) return false
+  if (process.platform === "linux" && !process.env["DISPLAY"] && !process.env["WAYLAND_DISPLAY"]) return false
+  return true
+}
 
 const parameters = z.object({
   url: z.string().describe("The URL to fetch content from"),
@@ -91,6 +98,7 @@ export const WebFetchTool = Tool.define(
 
               const cred = await resolveCredentials(params.url, store, log, timer.signal)
               const initial = await execute({ ...headers, ...cred })
+              const device = !browser()
 
               let response: Response | HttpClientResponse.HttpClientResponse =
                 initial.status === 403 && header(initial, "cf-mitigated") === "challenge"
@@ -118,12 +126,15 @@ export const WebFetchTool = Tool.define(
                     )
                   },
                   async openUrl(url) {
+                    if (device) {
+                      throw new Error("This environment does not support browser sign-in. Device authorization is required.")
+                    }
                     await (await import("open")).default(url)
                   },
                   async showDeviceCode(info) {
                     await Effect.runPromise(
                       ctx.metadata({
-                        title: "Authenticate webfetch request",
+                        title: SIGN_IN_TITLE,
                         metadata: {
                           url: params.url,
                           action: "device_code",
@@ -152,6 +163,7 @@ export const WebFetchTool = Tool.define(
                   callbackServer: new LocalCallbackServer(),
                   client: { name: "OpenCode", uri: "https://opencode.ai" },
                   logger: log,
+                  preferDevice: device,
                 })
                 if (authed) response = authed
               }

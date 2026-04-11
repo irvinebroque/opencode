@@ -10,15 +10,17 @@ When `webfetch` gets a 401 or 403 response, the orchestration layer in `orchestr
 
 2. **Discover the authorization server** (`discovery.ts`). Fetch the resource's `.well-known/oauth-protected-resource` metadata ([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728.html)) to find which authorization servers protect it, then fetch each server's `.well-known/oauth-authorization-server` metadata ([RFC 8414](https://www.rfc-editor.org/rfc/rfc8414.html)) to learn its endpoints and capabilities. Falls back to `.well-known/openid-configuration` (OIDC Discovery) if RFC 8414 is not available.
 
-3. **Resolve a client identity**. If a `client_id` is stored from a previous flow, reuse it. Otherwise, dynamically register a new client via [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html) if the AS supports it.
+3. **Resolve a client identity**. If an OAuth client from a previous flow is stored for the same issuer, reuse it. Otherwise, dynamically register a new client via [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html) if the AS supports it.
 
 4. **Execute the OAuth flow** (`flow.ts`):
    - **Authorization Code + PKCE** ([RFC 6749 &sect;4.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-4.1) + [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html)): Starts a local HTTP callback server on `127.0.0.1:19877` (with port fallback), delegates browser opening to the caller via the `Interaction` interface, waits for the callback with an authorization code, then exchanges the code (with PKCE verifier) for tokens.
    - **Device Authorization Grant** ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628.html)): For headless/SSH environments. Returns a `user_code` and `verification_uri` for the caller to display via the `Interaction` interface, then polls the token endpoint until authorization completes.
 
-5. **Store the credential** (`webfetch-auth.ts`) and retry the original request with the `Authorization: Bearer` header.
+5. **Store the credential** (`webfetch-auth.ts`) and retry the original request with the `Authorization: Bearer` header. The authenticated retry uses `redirect: "error"` so bearer tokens are not forwarded to redirect targets.
 
-On subsequent requests, stored tokens are attached automatically. Expired tokens are refreshed via the `refresh_token` grant before retrying.
+If discovery is unavailable but the server presented a Basic challenge, the orchestration layer returns an actionable error telling the caller to configure Basic credentials instead of attempting OAuth.
+
+On subsequent requests, stored tokens are attached automatically. Expired OAuth tokens are refreshed via the `refresh_token` grant before the request is sent.
 
 ## End-to-end flow
 
@@ -114,11 +116,11 @@ Executes OAuth flows:
 
 ### `webfetch-auth.ts`
 
-Credential types, matching logic, pure functions, and file-backed store for the webfetch auth system. Defines the `CredentialStore` interface and `Credential` type. Supports `bearer` and `basic` auth schemes. Credential lookup (`lookup()`) uses three-tier URL matching: exact URL, then origin, then longest path-prefix match (path-segment-boundary-aware, per [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html#section-3) protection space semantics). Handles token refresh via the `refresh_token` grant ([RFC 6749 &sect;6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)). Provides `resolveCredentials()` which combines lookup + auto-refresh for Layer 1 (pre-request credential injection). The file-backed store persists credentials as JSON at `$XDG_DATA_HOME/opencode/webfetch-auth.json` (file mode `0600`) using `Filesystem.readJson`/`writeJson`, following the same pattern as `Auth` and `McpAuth`.
+Credential types, matching logic, pure functions, and file-backed store for the webfetch auth system. Defines the `CredentialStore` interface and `Credential` type. Supports `bearer` and `basic` auth schemes. Credential lookup (`lookup()`) uses three-tier URL matching: exact URL, then longest path-prefix match, then origin match (path-segment-boundary-aware, per [RFC 6750](https://www.rfc-editor.org/rfc/rfc6750.html#section-3) protection space semantics). Handles token refresh via the `refresh_token` grant ([RFC 6749 &sect;6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6)). Provides `resolveCredentials()` which combines lookup + auto-refresh for Layer 1 (pre-request credential injection). The file-backed store persists credentials as JSON at `$XDG_DATA_HOME/opencode/webfetch-auth.json` (file mode `0600`) using `Filesystem.readJson`/`writeJson`, following the same pattern as `Auth` and `McpAuth`.
 
 ### `orchestrate.ts`
 
-Auth orchestration — Layer 2. Ties together: challenge parsing (`www-authenticate.ts`), metadata discovery (`discovery.ts`), user consent prompt via the `Interaction` interface, client resolution (stored credentials or dynamic registration), flow selection (auth code vs. device code via `flow.ts`), credential storage, and retry with credentials. Accepts a pluggable `CredentialStore`, `CallbackServer`, and `Interaction` to keep the orchestration logic decoupled from opencode-specific concerns.
+Auth orchestration — Layer 2. Ties together: challenge parsing (`www-authenticate.ts`), metadata discovery (`discovery.ts`), user consent prompt via the `Interaction` interface, client resolution (stored credentials or dynamic registration), flow selection (auth code vs. device code via `flow.ts`), credential storage, Basic-auth fallback messaging, and retry with credentials. Accepts a pluggable `CredentialStore`, `CallbackServer`, and `Interaction` to keep the orchestration logic decoupled from opencode-specific concerns.
 
 ### `index.ts`
 

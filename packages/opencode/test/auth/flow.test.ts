@@ -11,11 +11,23 @@
  * - Device code expires_in validation and clamping to MAX_DEVICE_CODE_LIFETIME
  */
 import { describe, test, expect, afterEach } from "bun:test"
-import { pkce, state, register, deviceCode, authorizationCode, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
+import { pkce, state, register, deviceCode, authorizationCode, LocalCallbackServer, MAX_DEVICE_CODE_LIFETIME } from "../../src/auth/flow"
 import type { ASMetadata, ResourceMetadata } from "../../src/auth/discovery"
 
 // RFC 7636 §4.1: code_verifier character set
 const PKCE_RE = /^[A-Za-z0-9\-._~]{43,128}$/
+
+async function freePort() {
+  const probe = Bun.serve({
+    port: 0,
+    fetch() {
+      return new Response("ok")
+    },
+  })
+  const port = probe.port as number
+  probe.stop()
+  return port
+}
 
 // ---------------------------------------------------------------------------
 // PKCE — RFC 7636 §4.1-§4.2
@@ -81,6 +93,93 @@ describe("state generation", () => {
 
   test("generates different values each time (CSPRNG)", () => {
     expect(state()).not.toBe(state())
+  })
+})
+
+describe("LocalCallbackServer", () => {
+  test("uses 127.0.0.1 in the default redirect URI", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1 })
+    const started = await server.start()
+    await server.stop()
+
+    expect(started.redirectUri).toBe(`http://127.0.0.1:${port}/oauth/callback`)
+  })
+
+  test("returns the authorization code and serves the success page", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1, timeout: 1000 })
+    const { redirectUri } = await server.start()
+
+    const waiting = server.waitForCode("expected-state")
+    const response = await fetch(`${redirectUri}?code=test-code&state=expected-state`)
+    const body = await response.text()
+
+    expect(response.status).toBe(200)
+    expect(body).toContain("Authorization Successful")
+    await expect(waiting).resolves.toBe("test-code")
+  })
+
+  test("ignores invalid state callbacks and keeps waiting", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1, timeout: 1000 })
+    const { redirectUri } = await server.start()
+
+    const waiting = server.waitForCode("expected-state")
+    const rejected = await fetch(`${redirectUri}?code=bad-code&state=wrong-state`)
+    const rejectedBody = await rejected.text()
+    const accepted = await fetch(`${redirectUri}?code=test-code&state=expected-state`)
+    const acceptedBody = await accepted.text()
+
+    expect(rejected.status).toBe(400)
+    expect(rejectedBody).toContain("Invalid state parameter")
+    expect(accepted.status).toBe(200)
+    expect(acceptedBody).toContain("Authorization Successful")
+    await expect(waiting).resolves.toBe("test-code")
+  })
+
+  test("rejects provider errors and escapes error HTML", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1, timeout: 1000 })
+    const { redirectUri } = await server.start()
+
+    const waiting = server.waitForCode("expected-state").catch((err) => err)
+    const response = await fetch(
+      `${redirectUri}?error=access_denied&error_description=${encodeURIComponent('<script>alert("xss")</script>')}&state=expected-state`,
+    )
+    const body = await response.text()
+    const result = await waiting
+
+    expect(response.status).toBe(200)
+    expect(body).toContain("Authorization Failed")
+    expect(body).toContain("&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;")
+    expect(body).not.toContain("<script>alert(\"xss\")</script>")
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toBe('Authorization error: <script>alert("xss")</script>')
+  })
+
+  test("rejects callbacks without an authorization code", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1, timeout: 1000 })
+    const { redirectUri } = await server.start()
+
+    const waiting = server.waitForCode("expected-state").catch((err) => err)
+    const response = await fetch(`${redirectUri}?state=expected-state`)
+    const body = await response.text()
+    const result = await waiting
+
+    expect(response.status).toBe(400)
+    expect(body).toContain("No authorization code")
+    expect(result).toBeInstanceOf(Error)
+    expect((result as Error).message).toBe("No authorization code in callback")
+  })
+
+  test("times out when no callback arrives", async () => {
+    const port = await freePort()
+    const server = new LocalCallbackServer({ port, portRetries: 1, timeout: 10 })
+    await server.start()
+
+    await expect(server.waitForCode("expected-state")).rejects.toThrow("authorization callback timed out")
   })
 })
 
@@ -317,10 +416,146 @@ describe("register() (RFC 7591)", () => {
 })
 
 describe("authorizationCode()", () => {
-  test("stops callback server when opening the browser fails", async () => {
-    let waitCalled = false
-    let stopCalled = 0
+  const servers: ReturnType<typeof Bun.serve>[] = []
+  afterEach(() => {
+    for (const s of servers) s.stop()
+    servers.length = 0
+  })
 
+  test("completes authorization code flow with deferred registration", async () => {
+    let auth: ReturnType<typeof Bun.serve>
+    let opened = ""
+    let sawRegistration = false
+    let sawToken = false
+
+    auth = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/register") {
+          sawRegistration = true
+          const body = await req.json() as Record<string, unknown>
+          expect(body.redirect_uris).toEqual(["http://127.0.0.1:19877/callback"])
+          expect(body.client_name).toBe("OpenCode")
+          return new Response(JSON.stringify({ client_id: "registered-client" }), {
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        if (url.pathname === "/token") {
+          sawToken = true
+          const body = new URLSearchParams(await req.text())
+          expect(body.get("grant_type")).toBe("authorization_code")
+          expect(body.get("code")).toBe("auth-code")
+          expect(body.get("redirect_uri")).toBe("http://127.0.0.1:19877/callback")
+          expect(body.get("client_id")).toBe("registered-client")
+          expect(body.get("resource")).toBe("https://api.example.com")
+          expect(body.get("code_verifier")).toBeTruthy()
+          return new Response(JSON.stringify({
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            token_type: "Bearer",
+            expires_in: 60,
+          }), {
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        return new Response("Not found", { status: 404 })
+      },
+    })
+    servers.push(auth)
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: `http://127.0.0.1:${auth.port as number}/authorize`,
+        token_endpoint: `http://127.0.0.1:${auth.port as number}/token`,
+        registration_endpoint: `http://127.0.0.1:${auth.port as number}/register`,
+        response_types_supported: ["code"],
+      },
+      undefined,
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            return "auth-code"
+          },
+          async stop() {},
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl(url) {
+            opened = url
+          },
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode", uri: "https://opencode.ai" },
+      },
+    )
+
+    expect(sawRegistration).toBe(true)
+    expect(sawToken).toBe(true)
+    expect(opened).toContain(`/authorize?response_type=code`)
+    expect(opened).toContain(`client_id=registered-client`)
+    expect(opened).toContain(`redirect_uri=${encodeURIComponent("http://127.0.0.1:19877/callback")}`)
+    expect(opened).toContain(`resource=${encodeURIComponent("https://api.example.com")}`)
+    expect(result).toEqual({
+      access_token: "access-token",
+      refresh_token: "refresh-token",
+      expires_in: 60,
+      scope: "read",
+      client: { client_id: "registered-client" },
+    })
+  })
+
+  test("returns undefined and stops callback server when no client can be resolved", async () => {
+    let stopCalled = 0
+    let opened = false
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: "https://as.example.com/authorize",
+        token_endpoint: "https://as.example.com/token",
+        response_types_supported: ["code"],
+      },
+      undefined,
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            return "code"
+          },
+          async stop() {
+            stopCalled++
+          },
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl() {
+            opened = true
+          },
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode" },
+      },
+    )
+
+    expect(result).toBeUndefined()
+    expect(opened).toBe(false)
+    expect(stopCalled).toBe(1)
+  })
+
+  test("returns undefined when callback server fails to start", async () => {
     const result = await authorizationCode(
       "https://api.example.com/data",
       { resource: "https://api.example.com", scopes_supported: ["read"] },
@@ -335,21 +570,16 @@ describe("authorizationCode()", () => {
       {
         server: {
           async start() {
-            return { redirectUri: "http://127.0.0.1:19877/callback" }
+            throw new Error("bind failed")
           },
           async waitForCode() {
-            waitCalled = true
             return "code"
           },
-          async stop() {
-            stopCalled++
-          },
+          async stop() {},
         },
         interaction: {
           async askConsent() {},
-          async openUrl() {
-            throw new Error("cannot open browser")
-          },
+          async openUrl() {},
           async showDeviceCode() {},
         },
         registration: { name: "OpenCode" },
@@ -357,8 +587,198 @@ describe("authorizationCode()", () => {
     )
 
     expect(result).toBeUndefined()
+  })
+
+  test("stops callback server and rethrows when opening the browser fails", async () => {
+    let waitCalled = false
+    let stopCalled = 0
+
+    await expect(
+      authorizationCode(
+        "https://api.example.com/data",
+        { resource: "https://api.example.com", scopes_supported: ["read"] },
+        {
+          issuer: "https://as.example.com",
+          authorization_endpoint: "https://as.example.com/authorize",
+          token_endpoint: "https://as.example.com/token",
+          response_types_supported: ["code"],
+        },
+        { client_id: "test-client" },
+        ["read"],
+        {
+          server: {
+            async start() {
+              return { redirectUri: "http://127.0.0.1:19877/callback" }
+            },
+            async waitForCode() {
+              waitCalled = true
+              return "code"
+            },
+            async stop() {
+              stopCalled++
+            },
+          },
+          interaction: {
+            async askConsent() {},
+            async openUrl() {
+              throw new Error("cannot open browser")
+            },
+            async showDeviceCode() {},
+          },
+          registration: { name: "OpenCode" },
+        },
+      ),
+    ).rejects.toThrow("cannot open browser")
+
     expect(waitCalled).toBe(false)
     expect(stopCalled).toBe(1)
+  })
+
+  test("returns undefined when callback never yields an authorization code", async () => {
+    let tokenHit = false
+    let auth: ReturnType<typeof Bun.serve>
+
+    auth = Bun.serve({
+      port: 0,
+      fetch() {
+        tokenHit = true
+        return new Response(JSON.stringify({ access_token: "token", token_type: "Bearer" }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      },
+    })
+    servers.push(auth)
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: `http://127.0.0.1:${auth.port as number}/authorize`,
+        token_endpoint: `http://127.0.0.1:${auth.port as number}/token`,
+        response_types_supported: ["code"],
+      },
+      { client_id: "test-client" },
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            throw new Error("timed out")
+          },
+          async stop() {},
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl() {},
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode" },
+      },
+    )
+
+    expect(result).toBeUndefined()
+    expect(tokenHit).toBe(false)
+  })
+
+  test("uses client_secret_basic by default for confidential clients", async () => {
+    let auth: ReturnType<typeof Bun.serve>
+
+    auth = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        expect(req.headers.get("authorization")).toBe(`Basic ${Buffer.from("test-client:secret", "utf-8").toString("base64")}`)
+        const body = new URLSearchParams(await req.text())
+        expect(body.get("client_id")).toBeNull()
+        expect(body.get("client_secret")).toBeNull()
+        expect(body.get("code")).toBe("auth-code")
+        return new Response(JSON.stringify({ access_token: "token", token_type: "Bearer" }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      },
+    })
+    servers.push(auth)
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: `http://127.0.0.1:${auth.port as number}/authorize`,
+        token_endpoint: `http://127.0.0.1:${auth.port as number}/token`,
+        response_types_supported: ["code"],
+      },
+      { client_id: "test-client", client_secret: "secret" },
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            return "auth-code"
+          },
+          async stop() {},
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl() {},
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode" },
+      },
+    )
+
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("token")
+  })
+
+  test("returns undefined when token response has unsupported token_type", async () => {
+    let auth: ReturnType<typeof Bun.serve>
+
+    auth = Bun.serve({
+      port: 0,
+      fetch() {
+        return new Response(JSON.stringify({ access_token: "token", token_type: "mac" }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      },
+    })
+    servers.push(auth)
+
+    const result = await authorizationCode(
+      "https://api.example.com/data",
+      { resource: "https://api.example.com", scopes_supported: ["read"] },
+      {
+        issuer: "https://as.example.com",
+        authorization_endpoint: `http://127.0.0.1:${auth.port as number}/authorize`,
+        token_endpoint: `http://127.0.0.1:${auth.port as number}/token`,
+        response_types_supported: ["code"],
+      },
+      { client_id: "test-client", client_secret: "secret" },
+      ["read"],
+      {
+        server: {
+          async start() {
+            return { redirectUri: "http://127.0.0.1:19877/callback" }
+          },
+          async waitForCode() {
+            return "auth-code"
+          },
+          async stop() {},
+        },
+        interaction: {
+          async askConsent() {},
+          async openUrl() {},
+          async showDeviceCode() {},
+        },
+        registration: { name: "OpenCode" },
+      },
+    )
+
+    expect(result).toBeUndefined()
   })
 })
 
@@ -558,6 +978,60 @@ describe("deviceCode() (RFC 8628)", () => {
     const result = await deviceCode("https://api.example.com/data", resource, meta, client)
     expect(result).toBeDefined()
     expect(result!.info.verification_uri).toBe("https://as.example.com/verify")
+  })
+
+  test("uses client_secret_basic when polling device tokens for confidential clients", async () => {
+    let polls = 0
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        const url = new URL(req.url)
+        if (url.pathname === "/device") {
+          return new Response(
+            JSON.stringify({
+              device_code: "test-device-code",
+              user_code: "ABCD-1234",
+              verification_uri: "https://as.example.com/verify",
+              expires_in: 60,
+              interval: 0,
+            }),
+            { headers: { "Content-Type": "application/json" } },
+          )
+        }
+
+        polls++
+        expect(req.headers.get("authorization")).toBe(`Basic ${Buffer.from("secret-client:secret", "utf-8").toString("base64")}`)
+        const body = new URLSearchParams(await req.text())
+        expect(body.get("client_id")).toBeNull()
+        expect(body.get("device_code")).toBe("test-device-code")
+        return new Response(
+          JSON.stringify({ access_token: "device-token", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      device_authorization_endpoint: `http://127.0.0.1:${s.port as number}/device`,
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+    }
+    const result = await deviceCode("https://api.example.com/data", resource, meta, {
+      client_id: "secret-client",
+      client_secret: "secret",
+    })
+
+    expect(result).toBeDefined()
+    await expect(result!.poll()).resolves.toEqual({
+      access_token: "device-token",
+      refresh_token: undefined,
+      expires_in: undefined,
+      scope: "read",
+      client: { client_id: "secret-client", client_secret: "secret" },
+    })
+    expect(polls).toBe(1)
   })
 
   test("slow_down increases interval cumulatively across polls (RFC 8628 §3.5)", async () => {

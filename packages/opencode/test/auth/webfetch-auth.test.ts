@@ -596,14 +596,52 @@ describe("refresh() (RFC 6749 §6)", () => {
     expect(result).toBeUndefined()
   })
 
-  test("includes client_secret when available", async () => {
+  test("uses client_secret_post when the AS requires it", async () => {
     const mem = new MemoryStore()
     const s = Bun.serve({
       port: 0,
       async fetch(req) {
+        expect(req.headers.get("authorization")).toBeNull()
         const body = new URLSearchParams(await req.text())
         expect(body.get("client_id")).toBe("my-client")
         expect(body.get("client_secret")).toBe("my-secret")
+
+        return new Response(
+          JSON.stringify({ access_token: "new-token", token_type: "Bearer" }),
+          { headers: { "Content-Type": "application/json" } },
+        )
+      },
+    })
+    servers.push(s)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+      oauth_client_id: "my-client",
+      oauth_client_secret: "my-secret",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+      token_endpoint_auth_methods_supported: ["client_secret_post"],
+    }
+    const result = await refresh(cred, meta, mem)
+    expect(result).toBeDefined()
+    expect(result!.access_token).toBe("new-token")
+  })
+
+  test("uses client_secret_basic by default for confidential clients", async () => {
+    const mem = new MemoryStore()
+    const s = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        expect(req.headers.get("authorization")).toBe(`Basic ${Buffer.from("my-client:my-secret", "utf-8").toString("base64")}`)
+        const body = new URLSearchParams(await req.text())
+        expect(body.get("client_id")).toBeNull()
+        expect(body.get("client_secret")).toBeNull()
 
         return new Response(
           JSON.stringify({ access_token: "new-token", token_type: "Bearer" }),
@@ -629,6 +667,39 @@ describe("refresh() (RFC 6749 §6)", () => {
     const result = await refresh(cred, meta, mem)
     expect(result).toBeDefined()
     expect(result!.access_token).toBe("new-token")
+  })
+
+  test("returns undefined when no supported token auth method exists for a confidential client", async () => {
+    const mem = new MemoryStore()
+    let hit = false
+    const s = Bun.serve({
+      port: 0,
+      fetch() {
+        hit = true
+        return new Response(JSON.stringify({ access_token: "new-token", token_type: "Bearer" }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      },
+    })
+    servers.push(s)
+
+    const cred: Credential = {
+      resource: "https://example.com",
+      scheme: "bearer",
+      access_token: "old",
+      refresh_token: "refresh-me",
+      oauth_client_id: "my-client",
+      oauth_client_secret: "my-secret",
+    }
+    const meta: ASMetadata = {
+      issuer: "https://as.example.com",
+      token_endpoint: `http://127.0.0.1:${s.port as number}/token`,
+      response_types_supported: ["code"],
+      token_endpoint_auth_methods_supported: ["private_key_jwt"],
+    }
+    const result = await refresh(cred, meta, mem)
+    expect(result).toBeUndefined()
+    expect(hit).toBe(false)
   })
 
   test("rejects refresh response missing token_type (RFC 6749 §5.1)", async () => {

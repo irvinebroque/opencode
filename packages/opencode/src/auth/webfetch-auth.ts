@@ -11,6 +11,7 @@
 
 import path from "path"
 import { requireHttps, isLoopback, isPrivateNetwork, fetchASMetadata, type ASMetadata } from "./discovery"
+import { tokenEndpointHeaders } from "./flow"
 import { Log } from "../util/log"
 import { Filesystem } from "../util/filesystem"
 import { Global } from "../global"
@@ -167,8 +168,18 @@ export async function refresh(
   // RFC 8707 §2.2: include resource parameter in refresh requests to
   // audience-restrict the new access token to the target resource.
   body.set("resource", cred.resource)
-  if (cred.oauth_client_id) body.set("client_id", cred.oauth_client_id)
-  if (cred.oauth_client_secret) body.set("client_secret", cred.oauth_client_secret)
+  const headers = cred.oauth_client_id
+    ? tokenEndpointHeaders(
+        metadata,
+        {
+          client_id: cred.oauth_client_id,
+          client_secret: cred.oauth_client_secret,
+        },
+        body,
+        logger,
+      )
+    : { "Content-Type": "application/x-www-form-urlencoded" }
+  if (!headers) return undefined
 
   logger.info("refreshing token", { resource: cred.resource, issuer: cred.issuer })
 
@@ -177,7 +188,7 @@ export async function refresh(
   // and resource identifiers to the redirect target.
   const response = await fetch(metadata.token_endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers,
     redirect: "error",
     signal,
     body: body.toString(),

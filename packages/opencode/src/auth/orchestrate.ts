@@ -107,7 +107,9 @@ export async function handleAuthChallenge(options: {
     })
 
     const supports = server.grant_types_supported ?? ["authorization_code"]
+    const canRegister = !!server.registration_endpoint && !!options.callbackServer
     let cred: Credential | undefined
+    let authError: Error | undefined
 
     if (supports.includes("authorization_code") && server.authorization_endpoint && options.callbackServer) {
       const tokens = await Flow.authorizationCode(
@@ -123,7 +125,10 @@ export async function handleAuthChallenge(options: {
           logger: log,
           signal: options.signal,
         },
-      )
+      ).catch((err) => {
+        authError = err instanceof Error ? err : new Error(String(err))
+        return undefined
+      })
       if (tokens) {
         cred = credential(result.resource.resource, tokens, server.issuer)
         await options.store.set(result.resource.resource, cred)
@@ -166,7 +171,11 @@ export async function handleAuthChallenge(options: {
     }
 
     if (!cred) {
-      if (!resolved) {
+      if (authError) {
+        last = authError
+        continue
+      }
+      if (!resolved && !canRegister) {
         const docs = server.service_documentation ?? server.issuer
         last = new Error(
           `This URL requires OAuth authentication via ${server.issuer}, ` +

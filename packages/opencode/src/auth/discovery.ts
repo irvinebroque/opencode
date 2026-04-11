@@ -48,6 +48,7 @@ export type ASMetadata = {
   response_types_supported: string[]
   grant_types_supported?: string[]
   code_challenge_methods_supported?: string[]
+  token_endpoint_auth_methods_supported?: string[]
   device_authorization_endpoint?: string
   service_documentation?: string
   jwks_uri?: string
@@ -62,7 +63,7 @@ export type ASMetadata = {
  * Validate that a URL uses HTTPS and is an absolute URI.
  * Returns the parsed URL or undefined if invalid.
  *
- * HTTP is permitted for loopback addresses (127.0.0.1 / [::1] / localhost)
+ * HTTP is permitted for loopback IP literals (127.0.0.1 / [::1])
  * per RFC 8252 §7.3 which allows HTTP for the loopback interface redirect.
  * This also enables testing with local mock servers.
  */
@@ -487,7 +488,7 @@ async function readJsonLimited(response: Response, limit: number): Promise<unkno
   }
 
   try {
-    return JSON.parse(await new Blob(chunks).text())
+    return JSON.parse(new TextDecoder().decode(Uint8Array.from(chunks.flatMap((chunk) => Array.from(chunk)))))
   } catch {
     return undefined
   }

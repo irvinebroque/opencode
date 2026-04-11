@@ -24,7 +24,7 @@
  * @see https://www.rfc-editor.org/rfc/rfc7591.html
  */
 
-import { createServer, type Server } from "node:http"
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { requireHttps, isLoopback, type ASMetadata, type ResourceMetadata } from "./discovery"
 import { Log } from "../util/log"
 
@@ -210,12 +210,24 @@ export class LocalCallbackServer implements CallbackServer {
 
   waitForCode(expectedState: string): Promise<string> {
     return new Promise((resolve, reject) => {
+      const srv = this.server!
+      let done = false
+      const finish = (cb: () => void, close: boolean) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        srv.off("request", onRequest)
+        if (close) setTimeout(() => this.stop(), 500)
+        cb()
+      }
       const timer = setTimeout(() => {
-        this.stop()
-        reject(new Error("authorization callback timed out"))
+        finish(() => {
+          void this.stop()
+          reject(new Error("authorization callback timed out"))
+        }, false)
       }, this.timeout)
 
-      this.server!.on("request", (req, res) => {
+      const onRequest = (req: IncomingMessage, res: ServerResponse) => {
         const url = new URL(req.url!, `http://${this.hostname}:${this.port}`)
         if (url.pathname !== this.callbackPath) {
           res.writeHead(404)
@@ -238,31 +250,27 @@ export class LocalCallbackServer implements CallbackServer {
         if (error) {
           res.writeHead(200, { "Content-Type": "text/html" })
           res.end(this.errorHtml(desc ?? error))
-          clearTimeout(timer)
           // Delay cleanup so the HTTP response is fully delivered
-          setTimeout(() => this.stop(), 500)
-          reject(new Error(`Authorization error: ${desc ?? error}`))
+          finish(() => reject(new Error(`Authorization error: ${desc ?? error}`)), true)
           return
         }
 
         if (!code) {
           res.writeHead(400, { "Content-Type": "text/html" })
           res.end(this.errorHtml("No authorization code"))
-          clearTimeout(timer)
-          setTimeout(() => this.stop(), 500)
-          reject(new Error("No authorization code in callback"))
+          finish(() => reject(new Error("No authorization code in callback")), true)
           return
         }
 
         res.writeHead(200, { "Content-Type": "text/html" })
         res.end(this.successHtml)
-        clearTimeout(timer)
         // Delay cleanup so the HTTP response is fully delivered to the browser
         // before the server shuts down. Without this, the user sees a connection
         // reset error instead of the success/error page.
-        setTimeout(() => this.stop(), 500)
-        resolve(code)
-      })
+        finish(() => resolve(code), true)
+      }
+
+      srv.on("request", onRequest)
     })
   }
 
@@ -323,6 +331,40 @@ export function state(): string {
 export type ClientInfo = {
   client_id: string
   client_secret?: string
+}
+
+export function tokenEndpointHeaders(
+  metadata: Pick<ASMetadata, "token_endpoint_auth_methods_supported">,
+  client: ClientInfo,
+  body: URLSearchParams,
+  logger: Log.Logger = Log.create({ service: "webfetch-auth" }),
+): Record<string, string> | undefined {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/x-www-form-urlencoded",
+  }
+
+  // Public clients authenticate only by identifying themselves to the token endpoint.
+  if (!client.client_secret) {
+    body.set("client_id", client.client_id)
+    return headers
+  }
+
+  const methods = metadata.token_endpoint_auth_methods_supported ?? ["client_secret_basic"]
+  if (methods.includes("client_secret_basic")) {
+    headers.Authorization = `Basic ${Buffer.from(`${client.client_id}:${client.client_secret}`, "utf-8").toString("base64")}`
+    return headers
+  }
+  if (methods.includes("client_secret_post")) {
+    body.set("client_id", client.client_id)
+    body.set("client_secret", client.client_secret)
+    return headers
+  }
+
+  logger.error("token endpoint auth method unsupported", {
+    client_id: client.client_id,
+    methods,
+  })
+  return undefined
 }
 
 export type TokenResult = {
@@ -533,7 +575,7 @@ export async function authorizationCode(
   } catch (err) {
     log.error("failed to open authorization URL", { error: String(err) })
     await opts.server.stop()
-    return undefined
+    throw err
   }
 
   // Log only the host — the full URL contains the state parameter and
@@ -554,20 +596,20 @@ export async function authorizationCode(
     grant_type: "authorization_code",
     code,
     redirect_uri: redirectUri,
-    client_id: resolved.client_id,
     code_verifier: codes.verifier,
   })
   // RFC 8707 §2.2: include resource parameter at the token endpoint to
   // audience-restrict the access token. RFC 9728 §7.4 RECOMMENDS this.
   body.set("resource", resourceMeta.resource)
-  if (resolved.client_secret) body.set("client_secret", resolved.client_secret)
+  const headers = tokenEndpointHeaders(asMeta, resolved, body, log)
+  if (!headers) return undefined
 
   // redirect: "error" prevents a malicious AS from redirecting the token
   // exchange POST to an internal service, leaking auth codes, PKCE verifiers,
   // and client secrets to the redirect target.
   const response = await fetch(asMeta.token_endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers,
     redirect: "error",
     signal: opts.signal,
     body: body.toString(),
@@ -744,15 +786,16 @@ export async function deviceCode(
       const body = new URLSearchParams({
         grant_type: "urn:ietf:params:oauth:grant-type:device_code",
         device_code: data!.device_code,
-        client_id: client.client_id,
       })
+      const headers = tokenEndpointHeaders(asMeta, client, body, log)
+      if (!headers) return undefined
 
       // redirect: "error" prevents a malicious AS from redirecting the device
       // code token poll to an internal service, leaking device_code and
       // client_id to the redirect target.
       const response = await fetch(asMeta.token_endpoint!, {
         method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        headers,
         redirect: "error",
         signal,
         body: body.toString(),

@@ -57,7 +57,7 @@ export class Handler {
         toolCall: {
           toolCallId: permission.tool?.callID ?? permission.id,
           status: "pending",
-          title: permission.permission,
+          title: permission.permission === "webfetch_auth" ? "Sign in to access this URL" : permission.permission,
           rawInput: permission.metadata,
           kind: toToolKind(permission.permission),
           locations: toLocations(permission.permission, permission.metadata),

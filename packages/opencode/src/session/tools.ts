@@ -27,6 +27,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   session: Session.Info
   processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
   bypassAgentCheck: boolean
+  headless?: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
 }) {
@@ -43,7 +44,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     abort: options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
-    extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
+    extra: {
+      model: input.model,
+      bypassAgentCheck: input.bypassAgentCheck,
+      promptOps: input.promptOps,
+      headless: input.headless,
+    },
     agent: input.agent.name,
     messages: input.messages,
     metadata: (val) =>

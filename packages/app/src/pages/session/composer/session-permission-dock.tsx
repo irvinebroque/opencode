@@ -11,6 +11,11 @@ export function SessionPermissionDock(props: {
   onDecide: (response: "once" | "always" | "reject") => void
 }) {
   const language = useLanguage()
+  const metadata = () => props.request.metadata ?? {}
+  const metaString = (key: string) => {
+    const value = metadata()[key]
+    return typeof value === "string" ? value : ""
+  }
 
   const toolDescription = () => {
     const key = `settings.permissions.tool.${props.request.permission}.description`
@@ -57,6 +62,27 @@ export function SessionPermissionDock(props: {
           <span data-slot="permission-spacer" aria-hidden="true" />
           <div data-slot="permission-hint">{toolDescription()}</div>
         </div>
+      </Show>
+
+      <Show when={props.request.permission === "webfetch_auth"}>
+        <For
+          each={[
+            ["URL", metaString("url")],
+            ["Authorization server", metaString("server")],
+            ["Scopes", metaString("scopes")],
+            ["Visit", metaString("verification_uri")],
+            ["Code", metaString("user_code")],
+          ].filter((item) => item[1])}
+        >
+          {(item) => (
+            <div data-slot="permission-row">
+              <span data-slot="permission-spacer" aria-hidden="true" />
+              <div data-slot="permission-hint">
+                {item[0]}: {item[1]}
+              </div>
+            </div>
+          )}
+        </For>
       </Show>
 
       <Show when={props.request.patterns.length > 0}>

@@ -116,6 +116,7 @@ export const Plugin = PluginV2.define({
       { action: "question", resource: "*", effect: "deny" },
       { action: "plan_enter", resource: "*", effect: "deny" },
       { action: "plan_exit", resource: "*", effect: "deny" },
+      { action: "webfetch_auth", resource: "*", effect: "ask" },
       { action: "read", resource: "*", effect: "allow" },
       { action: "read", resource: "*.env", effect: "ask" },
       { action: "read", resource: "*.env.*", effect: "ask" },

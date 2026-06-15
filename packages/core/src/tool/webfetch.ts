@@ -5,9 +5,12 @@ import { Duration, Effect, Layer, Schema, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import TurndownService from "turndown"
+import { FSUtil } from "../fs-util"
+import { Global } from "../global"
 import { PermissionV2 } from "../permission"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { WebFetchAuth } from "./webfetch-auth"
 
 export const name = "webfetch"
 export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024
@@ -75,8 +78,12 @@ const isCloudflareChallenge = (error: unknown) => {
   return response.status === 403 && response.headers["cf-mitigated"] === "challenge"
 }
 
-const request = (url: string, format: Format, userAgent = browserUserAgent) =>
-  HttpClientRequest.get(url).pipe(HttpClientRequest.setHeaders(headers(format, userAgent)))
+const request = (
+  url: string,
+  format: Format,
+  userAgent = browserUserAgent,
+  extraHeaders: Record<string, string> = {},
+) => HttpClientRequest.get(url).pipe(HttpClientRequest.setHeaders({ ...headers(format, userAgent), ...extraHeaders }))
 
 const assertHttpUrl = (url: URL) => {
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("URL must use http:// or https://")
@@ -84,6 +91,33 @@ const assertHttpUrl = (url: URL) => {
 
 const execute = (http: HttpClient.HttpClient, url: string, format: Format, userAgent = browserUserAgent) =>
   http.execute(request(url, format, userAgent)).pipe(Effect.flatMap(HttpClientResponse.filterStatusOk))
+
+const hasAuthChallenge = (status: number, headers: Headers | Record<string, string | undefined>) =>
+  (status === 401 || status === 403) && WebFetchAuth.challenges(headers).length > 0
+
+const authChallengeResponse = (error: unknown) => {
+  if (!error || typeof error !== "object" || !("reason" in error)) return
+  const reason = error.reason
+  if (
+    !reason ||
+    typeof reason !== "object" ||
+    !("_tag" in reason) ||
+    reason._tag !== "StatusCodeError" ||
+    !("response" in reason)
+  )
+    return
+  const response = reason.response as HttpClientResponse.HttpClientResponse
+  return hasAuthChallenge(response.status, response.headers) ? response : undefined
+}
+
+const fetchWithAuthorization = (url: string, format: Format, extraHeaders: Record<string, string>) =>
+  Effect.tryPromise({
+    try: () => fetch(url, { headers: { ...headers(format, browserUserAgent), ...extraHeaders }, redirect: "error" }),
+    catch: (error) => error,
+  })
+
+const fromWebResponse = (url: string, format: Format, response: Response) =>
+  HttpClientResponse.fromWeb(request(url, format), response)
 
 const collectBody = (response: HttpClientResponse.HttpClientResponse) =>
   Effect.gen(function* () {
@@ -129,6 +163,9 @@ export const layer = Layer.effectDiscard(
     const tools = yield* Tools.Service
     const http = yield* HttpClient.HttpClient
     const permission = yield* PermissionV2.Service
+    const fs = yield* FSUtil.Service
+    const global = yield* Global.Service
+    const store = WebFetchAuth.fileStore(fs, global)
 
     yield* tools
       .register({
@@ -154,10 +191,149 @@ export const layer = Layer.effectDiscard(
                 source: { type: "tool", messageID: context.assistantMessageID, callID: context.toolCallID },
               })
 
-              const { body, contentType } = yield* Effect.gen(function* () {
-                const response = yield* execute(http, input.url, input.format).pipe(
+              const source = {
+                type: "tool" as const,
+                messageID: context.assistantMessageID,
+                callID: context.toolCallID,
+              }
+              const timeout = Effect.timeoutOrElse({
+                duration: Duration.seconds(input.timeout ?? DEFAULT_TIMEOUT_SECONDS),
+                orElse: () => Effect.fail(new Error("Request timed out")),
+              })
+              const response = yield* Effect.gen(function* () {
+                const authHeaders = yield* Effect.tryPromise(() => WebFetchAuth.resolveCredentials(input.url, store))
+                if (authHeaders.Authorization) {
+                  const response = yield* fetchWithAuthorization(input.url, input.format, authHeaders).pipe(timeout)
+                  if (response.ok) return fromWebResponse(input.url, input.format, response)
+                  if (!hasAuthChallenge(response.status, response.headers)) {
+                    return yield* Effect.fail(new Error(`Request failed with status code: ${response.status}`))
+                  }
+                  const authed = yield* Effect.tryPromise(() =>
+                    WebFetchAuth.handleAuthChallenge({
+                      headers: response.headers,
+                      url: input.url,
+                      baseHeaders: headers(input.format, browserUserAgent),
+                      store,
+                      callbackServer: new WebFetchAuth.LocalCallbackServer(),
+                      client: { name: "OpenCode", uri: "https://opencode.ai" },
+                      interaction: {
+                        askConsent: (info) =>
+                          Effect.runPromise(
+                            permission.assert({
+                              action: "webfetch_auth",
+                              resources: [input.url],
+                              save: [input.url],
+                              metadata: {
+                                url: input.url,
+                                action: "authenticate",
+                                server: info.server,
+                                scopes: info.scopes?.join(", ") ?? "server default",
+                              },
+                              sessionID: context.sessionID,
+                              agent: context.agent,
+                              source,
+                            }),
+                          ),
+                        openUrl: WebFetchAuth.openAuthorizationUrl,
+                        showDeviceCode: (info) =>
+                          Effect.runPromise(
+                            permission.assert({
+                              action: "webfetch_auth",
+                              resources: [`${input.url}#device-code`],
+                              metadata: {
+                                url: input.url,
+                                action: "device_code",
+                                verification_uri: info.verification_uri,
+                                user_code: info.user_code,
+                              },
+                              sessionID: context.sessionID,
+                              agent: context.agent,
+                              source,
+                            }),
+                          ),
+                      },
+                      preferDevice: process.env.OPENCODE_WEBFETCH_OAUTH_DEVICE === "1",
+                    }),
+                  ).pipe(
+                    Effect.timeoutOrElse({
+                      duration: Duration.seconds(WebFetchAuth.AUTH_TIMEOUT_SECONDS),
+                      orElse: () => Effect.fail(new Error("Authentication timed out")),
+                    }),
+                  )
+                  if (!authed)
+                    return yield* Effect.fail(new Error(`Request failed with status code: ${response.status}`))
+                  return fromWebResponse(input.url, input.format, authed)
+                }
+
+                return yield* execute(http, input.url, input.format).pipe(
                   Effect.catchIf(isCloudflareChallenge, () => execute(http, input.url, input.format, "opencode")),
+                  timeout,
+                  Effect.catchIf(
+                    (error) => authChallengeResponse(error) !== undefined,
+                    (error) =>
+                      Effect.gen(function* () {
+                        const challenged = authChallengeResponse(error)
+                        if (!challenged) return yield* Effect.fail(error)
+                        const authed = yield* Effect.tryPromise(() =>
+                          WebFetchAuth.handleAuthChallenge({
+                            headers: challenged.headers,
+                            url: input.url,
+                            baseHeaders: headers(input.format, browserUserAgent),
+                            store,
+                            callbackServer: new WebFetchAuth.LocalCallbackServer(),
+                            client: { name: "OpenCode", uri: "https://opencode.ai" },
+                            interaction: {
+                              askConsent: (info) =>
+                                Effect.runPromise(
+                                  permission.assert({
+                                    action: "webfetch_auth",
+                                    resources: [input.url],
+                                    save: [input.url],
+                                    metadata: {
+                                      url: input.url,
+                                      action: "authenticate",
+                                      server: info.server,
+                                      scopes: info.scopes?.join(", ") ?? "server default",
+                                    },
+                                    sessionID: context.sessionID,
+                                    agent: context.agent,
+                                    source,
+                                  }),
+                                ),
+                              openUrl: WebFetchAuth.openAuthorizationUrl,
+                              showDeviceCode: (info) =>
+                                Effect.runPromise(
+                                  permission.assert({
+                                    action: "webfetch_auth",
+                                    resources: [`${input.url}#device-code`],
+                                    metadata: {
+                                      url: input.url,
+                                      action: "device_code",
+                                      verification_uri: info.verification_uri,
+                                      user_code: info.user_code,
+                                    },
+                                    sessionID: context.sessionID,
+                                    agent: context.agent,
+                                    source,
+                                  }),
+                                ),
+                            },
+                            preferDevice: process.env.OPENCODE_WEBFETCH_OAUTH_DEVICE === "1",
+                          }),
+                        ).pipe(
+                          Effect.timeoutOrElse({
+                            duration: Duration.seconds(WebFetchAuth.AUTH_TIMEOUT_SECONDS),
+                            orElse: () => Effect.fail(new Error("Authentication timed out")),
+                          }),
+                        )
+                        if (!authed) return yield* Effect.fail(error)
+                        return fromWebResponse(input.url, input.format, authed)
+                      }),
+                  ),
                 )
+              })
+
+              const { body, contentType } = yield* Effect.gen(function* () {
                 const contentType = response.headers["content-type"] || ""
                 const mime = mimeFrom(contentType)
                 if (isImageAttachment(mime))
@@ -165,12 +341,7 @@ export const layer = Layer.effectDiscard(
                 if (!isTextualMime(mime))
                   return yield* Effect.fail(new Error(`Unsupported fetched file content type: ${mime}`))
                 return { body: yield* collectBody(response), contentType }
-              }).pipe(
-                Effect.timeoutOrElse({
-                  duration: Duration.seconds(input.timeout ?? DEFAULT_TIMEOUT_SECONDS),
-                  orElse: () => Effect.fail(new Error("Request timed out")),
-                }),
-              )
+              })
               const content = convert(new TextDecoder().decode(body), contentType, input.format)
               return {
                 url: input.url,

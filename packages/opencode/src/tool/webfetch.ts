@@ -1,14 +1,32 @@
 import { Effect, Schema } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { Parser } from "htmlparser2"
 import * as Tool from "./tool"
 import TurndownService from "turndown"
 import DESCRIPTION from "./webfetch.txt"
 import { isImageAttachment } from "@/util/media"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
+import { WebFetchAuth } from "@opencode-ai/core/tool/webfetch-auth"
 
 const MAX_RESPONSE_SIZE = 5 * 1024 * 1024 // 5MB
 const DEFAULT_TIMEOUT = 30 * 1000 // 30 seconds
 const MAX_TIMEOUT = 120 * 1000 // 2 minutes
+const SIGN_IN_TITLE = "Sign in to access this URL"
+
+function abortAfterAny(timeout: number, parent: AbortSignal) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(new Error("Request timed out")), timeout)
+  const abort = () => controller.abort(parent.reason)
+  parent.addEventListener("abort", abort, { once: true })
+  return {
+    signal: controller.signal,
+    clear() {
+      clearTimeout(timer)
+      parent.removeEventListener("abort", abort)
+    },
+  }
+}
 
 export const Parameters = Schema.Struct({
   url: Schema.String.annotate({ description: "The URL to fetch content from" }),
@@ -25,7 +43,9 @@ export const WebFetchTool = Tool.define(
   "webfetch",
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
-    const httpOk = HttpClient.filterStatusOk(http)
+    const fs = yield* FSUtil.Service
+    const global = yield* Global.Service
+    const store = WebFetchAuth.fileStore(fs, global)
 
     return {
       description: DESCRIPTION,
@@ -73,37 +93,107 @@ export const WebFetchTool = Tool.define(
             "Accept-Language": "en-US,en;q=0.9",
           }
 
-          const request = HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(headers))
+          const header = (response: Response | HttpClientResponse.HttpClientResponse, key: string) =>
+            response instanceof Response ? (response.headers.get(key) ?? "") : (response.headers[key] ?? "")
+          const ok = (response: Response | HttpClientResponse.HttpClientResponse) =>
+            response.status >= 200 && response.status < 300
 
-          // Retry with honest UA if blocked by Cloudflare bot detection (TLS fingerprint mismatch)
-          const response = yield* httpOk.execute(request).pipe(
-            Effect.catchIf(
-              (err) =>
-                err.reason._tag === "StatusCodeError" &&
-                err.reason.response.status === 403 &&
-                err.reason.response.headers["cf-mitigated"] === "challenge",
-              () =>
-                httpOk.execute(
-                  HttpClientRequest.get(params.url).pipe(
-                    HttpClientRequest.setHeaders({ ...headers, "User-Agent": "opencode" }),
-                  ),
-                ),
-            ),
-            Effect.timeoutOrElse({ duration: timeout, orElse: () => Effect.die(new Error("Request timed out")) }),
-          )
+          const response = yield* Effect.promise(async () => {
+            const timer = abortAfterAny(timeout, ctx.abort)
+            let auth: ReturnType<typeof abortAfterAny> | undefined
+            const execute = (requestHeaders: Record<string, string>) =>
+              Effect.runPromise(
+                http.execute(HttpClientRequest.get(params.url).pipe(HttpClientRequest.setHeaders(requestHeaders))),
+              )
+            const fetchAuthorized = (requestHeaders: Record<string, string>) =>
+              fetch(params.url, { headers: requestHeaders, redirect: "error", signal: timer.signal })
+            try {
+              const stored = await WebFetchAuth.resolveCredentials(params.url, store, undefined, timer.signal)
+              const initial = stored.Authorization
+                ? await fetchAuthorized({ ...headers, ...stored })
+                : await execute(headers)
+              let response: Response | HttpClientResponse.HttpClientResponse =
+                initial.status === 403 && header(initial, "cf-mitigated") === "challenge"
+                  ? stored.Authorization
+                    ? await fetchAuthorized({ ...headers, ...stored, "User-Agent": "opencode" })
+                    : await execute({ ...headers, "User-Agent": "opencode" })
+                  : initial
+
+              const shouldAuth =
+                !ok(response) &&
+                (response.status === 401 || (response.status === 403 && !!header(response, "www-authenticate")))
+              if (shouldAuth) {
+                auth = abortAfterAny(WebFetchAuth.AUTH_TIMEOUT_SECONDS * 1000, ctx.abort)
+                const interaction: WebFetchAuth.Interaction = {
+                  askConsent: (info) =>
+                    Effect.runPromise(
+                      ctx.ask({
+                        permission: "webfetch_auth",
+                        patterns: [params.url],
+                        always: [params.url],
+                        metadata: {
+                          url: params.url,
+                          action: "authenticate",
+                          server: info.server,
+                          scopes: info.scopes?.join(", ") ?? "server default",
+                        },
+                      }),
+                    ),
+                  openUrl: WebFetchAuth.openAuthorizationUrl,
+                  showDeviceCode: (info) =>
+                    Effect.runPromise(
+                      ctx.metadata({
+                        title: SIGN_IN_TITLE,
+                        metadata: {
+                          url: params.url,
+                          action: "device_code",
+                          verification_uri: info.verification_uri,
+                          user_code: info.user_code,
+                        },
+                      }),
+                    ),
+                }
+                const authed = await WebFetchAuth.handleAuthChallenge({
+                  headers: response instanceof Response ? response.headers : response.headers,
+                  url: params.url,
+                  baseHeaders: headers,
+                  signal: auth.signal,
+                  store,
+                  interaction,
+                  callbackServer: new WebFetchAuth.LocalCallbackServer(),
+                  client: { name: "OpenCode", uri: "https://opencode.ai" },
+                  preferDevice: ctx.extra?.headless === true || process.env.OPENCODE_WEBFETCH_OAUTH_DEVICE === "1",
+                })
+                if (authed) response = authed
+              }
+
+              if (!ok(response)) throw new Error(`Request failed with status code: ${response.status}`)
+              return response
+            } catch (error) {
+              if ((timer.signal.aborted || auth?.signal.aborted) && !ctx.abort.aborted)
+                throw new Error("Request timed out", { cause: error })
+              throw error
+            } finally {
+              auth?.clear()
+              timer.clear()
+            }
+          })
 
           // Check content length
-          const contentLength = response.headers["content-length"]
+          const contentLength = header(response, "content-length")
           if (contentLength && parseInt(contentLength) > MAX_RESPONSE_SIZE) {
             throw new Error("Response too large (exceeds 5MB limit)")
           }
 
-          const arrayBuffer = yield* response.arrayBuffer
+          const arrayBuffer =
+            response instanceof Response
+              ? yield* Effect.promise(() => response.arrayBuffer())
+              : yield* response.arrayBuffer
           if (arrayBuffer.byteLength > MAX_RESPONSE_SIZE) {
             throw new Error("Response too large (exceeds 5MB limit)")
           }
 
-          const contentType = response.headers["content-type"] || ""
+          const contentType = header(response, "content-type")
           const mime = contentType.split(";")[0]?.trim().toLowerCase() || ""
           const title = `${params.url} (${contentType})`
 

@@ -257,6 +257,7 @@ export type UserMessage = {
   tools?: {
     [key: string]: boolean
   }
+  headless?: boolean
 }
 
 export type ProviderAuthError = {
@@ -1699,6 +1700,7 @@ export type PermissionConfig =
       todowrite?: PermissionActionConfig
       question?: PermissionActionConfig
       webfetch?: PermissionActionConfig
+      webfetch_auth?: PermissionActionConfig
       websearch?: PermissionActionConfig
       lsp?: PermissionRuleConfig
       doom_loop?: PermissionActionConfig
@@ -7837,6 +7839,7 @@ export type SessionPromptData = {
     }
     agent?: string
     noReply?: boolean
+    headless?: boolean
     tools?: {
       [key: string]: boolean
     }
@@ -8184,6 +8187,7 @@ export type SessionPromptAsyncData = {
     }
     agent?: string
     noReply?: boolean
+    headless?: boolean
     tools?: {
       [key: string]: boolean
     }

@@ -674,6 +674,7 @@ export const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
+        headless: input.headless,
       }
 
       if (current?.agent !== info.agent) {
@@ -1273,6 +1274,7 @@ export const layer = Layer.effect(
 
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+            const lastUserInfo = lastUserMsg?.info.role === "user" ? lastUserMsg.info : undefined
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
 
@@ -1282,6 +1284,7 @@ export const layer = Layer.effect(
               model,
               processor: handle,
               bypassAgentCheck,
+              headless: lastUserInfo?.headless === true,
               messages: msgs,
               promptOps,
             }).pipe(
@@ -1597,6 +1600,7 @@ export const PromptInput = Schema.Struct({
   model: Schema.optional(ModelRef),
   agent: Schema.optional(Schema.String),
   noReply: Schema.optional(Schema.Boolean),
+  headless: Schema.optional(Schema.Boolean),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)).annotate({
     description:
       "@deprecated tools and permissions have been merged, you can set permissions on the session itself now",

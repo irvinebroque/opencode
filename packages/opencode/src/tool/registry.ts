@@ -52,6 +52,7 @@ import { BackgroundJob } from "@/background/job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Global } from "@opencode-ai/core/global"
 
 export function webSearchEnabled(providerID: ProviderV2.ID, flags = { exa: false, parallel: false }) {
   return providerID === ProviderV2.ID.opencode || flags.exa || flags.parallel
@@ -330,6 +331,7 @@ export const defaultLayer = Layer.suspend(() =>
       Layer.provide(LSP.defaultLayer),
       Layer.provide(Instruction.defaultLayer),
       Layer.provide(FSUtil.defaultLayer),
+      Layer.provide(Global.defaultLayer),
       Layer.provide(EventV2Bridge.defaultLayer),
       Layer.provide(FetchHttpClient.layer),
       Layer.provide(Format.defaultLayer),
@@ -428,6 +430,7 @@ export const node = LayerNode.make(layer.pipe(Layer.provide(Ripgrep.defaultLayer
   LSP.node,
   Instruction.node,
   FSUtil.node,
+  Global.node,
   EventV2Bridge.node,
   httpClient,
   CrossSpawnSpawner.node,

@@ -316,6 +316,38 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               }
             }
 
+            if (permission === "webfetch_auth") {
+              const url = typeof data.url === "string" ? data.url : ""
+              const server = typeof data.server === "string" ? data.server : ""
+              const scopes = typeof data.scopes === "string" ? data.scopes : ""
+              const verificationUri = typeof data.verification_uri === "string" ? data.verification_uri : ""
+              const userCode = typeof data.user_code === "string" ? data.user_code : ""
+              return {
+                icon: "%",
+                title: `Sign in to access ${url || "this URL"}`,
+                body: (
+                  <box paddingLeft={1} gap={0}>
+                    <Show when={url}>
+                      <text fg={theme.textMuted}>{"URL: " + url}</text>
+                    </Show>
+                    <Show when={server}>
+                      <text fg={theme.textMuted}>{"Authorization server: " + server}</text>
+                    </Show>
+                    <Show when={scopes}>
+                      <text fg={theme.textMuted}>{"Scopes: " + scopes}</text>
+                    </Show>
+                    <Show when={verificationUri}>
+                      <text fg={theme.textMuted}>{"Visit: " + verificationUri}</text>
+                    </Show>
+                    <Show when={userCode}>
+                      <text fg={theme.text}>{"Code: " + userCode}</text>
+                    </Show>
+                    <text fg={theme.textMuted}>OpenCode will store OAuth credentials for this resource.</text>
+                  </box>
+                ),
+              }
+            }
+
             if (permission === "websearch") {
               const query = typeof data.query === "string" ? data.query : ""
               return {

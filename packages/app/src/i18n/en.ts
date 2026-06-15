@@ -1001,6 +1001,8 @@ export const dict = {
   "settings.permissions.tool.todowrite.description": "Update the todo list",
   "settings.permissions.tool.webfetch.title": "Web Fetch",
   "settings.permissions.tool.webfetch.description": "Fetch content from a URL",
+  "settings.permissions.tool.webfetch_auth.title": "Web Fetch sign-in",
+  "settings.permissions.tool.webfetch_auth.description": "Sign in and store OAuth credentials for a protected URL",
   "settings.permissions.tool.websearch.title": "Web Search",
   "settings.permissions.tool.websearch.description": "Search the web",
   "settings.permissions.tool.external_directory.title": "External Directory",

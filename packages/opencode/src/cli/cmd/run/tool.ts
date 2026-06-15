@@ -751,7 +751,7 @@ function scrollPatchFinal(p: ToolProps<typeof ApplyPatchTool>): string {
     return rows.join("\n")
   }
 
-  return patchLine(files[0]!)
+  return patchLine(files[0])
 }
 
 function scrollTaskStart(_: ToolProps<typeof TaskTool>): string {
@@ -1347,6 +1347,26 @@ export function toolPermissionInfo(
   meta: ToolDict,
   patterns: string[],
 ): ToolPermissionInfo | undefined {
+  if (name === "webfetch_auth") {
+    const url = text(meta.url) || patterns[0] || ""
+    const server = text(meta.server)
+    const scopes = text(meta.scopes)
+    const verificationUri = text(meta.verification_uri)
+    const userCode = text(meta.user_code)
+    return {
+      icon: "%",
+      title: `Sign in to access ${url || "this URL"}`,
+      lines: [
+        ...(url ? [`URL: ${url}`] : []),
+        ...(server ? [`Authorization server: ${server}`] : []),
+        ...(scopes ? [`Scopes: ${scopes}`] : []),
+        ...(verificationUri ? [`Visit: ${verificationUri}`] : []),
+        ...(userCode ? [`Code: ${userCode}`] : []),
+        "OpenCode will store OAuth credentials for this resource.",
+      ],
+    }
+  }
+
   const draw = rule(name)?.permission
   if (!draw) {
     return undefined

@@ -56,6 +56,7 @@ import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { Global } from "@opencode-ai/core/global"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -178,6 +179,7 @@ function makePrompt(input?: { processor?: "blocking" }) {
     lsp,
     mcp,
     FSUtil.defaultLayer,
+    Global.defaultLayer,
     BackgroundJob.defaultLayer,
     status,
     Database.defaultLayer,
@@ -852,7 +854,7 @@ it.instance("subtask child inherits parent session external_directory allow", ()
 
     const kids = yield* sessions.children(chat.id)
     expect(kids).toHaveLength(1)
-    const child = kids[0]!
+    const child = kids[0]
     const rules = child.permission ?? []
     expect(rules).toEqual(
       expect.arrayContaining([{ permission: "external_directory", pattern: "/tmp/allowed/*", action: "allow" }]),
